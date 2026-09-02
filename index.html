@@ -627,7 +627,9 @@ function App() {
     tasks.forEach(t => rows.push([t]));
 
     const csv = rows.map(r => r.map(v => `"${String(v).replace(/"/g, '""')}"`).join(",")).join("\n");
-    download(`time_log_${fmtDate(new Date())}.csv`, csv, "text/csv");
+    const now = new Date();
+    const stamp = `${fmtDate(now)}_${PAD(now.getHours())}${PAD(now.getMinutes())}${PAD(now.getSeconds())}`;
+    download(`time_log_${stamp}.csv`, csv, "text/csv");
     setLastExportAt(Date.now());
   }
 
@@ -1063,6 +1065,10 @@ root.render(<App />);
 </script>
 
 <script>
+  // Manually transform and run the app source above, forcing the classic
+  // JSX runtime (plain React.createElement calls, no import statements) —
+  // avoids relying on Babel's automatic script-tag scanner, which doesn't
+  // reliably parse preset options passed via the data-presets attribute.
   const appSrc = document.getElementById("app-source").textContent;
   const { code } = Babel.transform(appSrc, {
     presets: [["react", { runtime: "classic" }]],
