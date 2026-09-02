@@ -1,0 +1,1073 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+<title>Time Tracker</title>
+<link rel="manifest" href="manifest.json" />
+<meta name="theme-color" content="#1a1a1a" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black" />
+<style>
+  :root {
+    --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --color-background-primary: #ffffff;
+    --color-background-secondary: #f5f4f2;
+    --color-text-primary: #1a1a1a;
+    --color-text-secondary: #6b6b6b;
+    --color-text-tertiary: #9a9a9a;
+    --color-text-danger: #c0392b;
+    --color-background-danger: #fdecea;
+    --color-border-secondary: #cccccc;
+    --color-border-tertiary: #dddddd;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: #e9e8e5; font-family: var(--font-sans); }
+  #root { max-width: 720px; margin: 0 auto; min-height: 100vh; }
+  button, input, select { font-family: inherit; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script crossorigin src="https://unpkg.com/papaparse@5.4.1/papaparse.min.js"></script>
+
+<script type="text/babel" data-presets="env,react">
+const { useState, useEffect, useRef, useCallback } = React;
+
+/* ── Time & date helpers ──────────────────────────────────────────── */
+
+const PAD = n => String(n).padStart(2, "0");
+const fmtDate = d => `${d.getFullYear()}-${PAD(d.getMonth() + 1)}-${PAD(d.getDate())}`;
+const localDate = dateStr => new Date(`${dateStr}T12:00:00`);
+
+const fmt12 = t => {
+  if (!t) return "";
+  const [h, m] = t.split(":").map(Number);
+  return `${h % 12 || 12}:${PAD(m)} ${h >= 12 ? "PM" : "AM"}`;
+};
+const toMins = t => {
+  if (!t) return 0;
+  const [h, m] = t.split(":").map(Number);
+  return h * 60 + m;
+};
+const minsToHHMM = mins => `${PAD(Math.floor(mins / 60))}:${PAD(mins % 60)}`;
+const clockOf = d => `${PAD(d.getHours())}:${PAD(d.getMinutes())}`;
+
+const getMonday = dateStr => {
+  const d = localDate(dateStr);
+  d.setDate(d.getDate() + (d.getDay() === 0 ? -6 : 1 - d.getDay()));
+  return fmtDate(d);
+};
+const getSunday = mon => {
+  const d = localDate(mon);
+  d.setDate(d.getDate() + 6);
+  return fmtDate(d);
+};
+const weekLabel = mon => {
+  const short = s => {
+    const d = localDate(s);
+    return `${d.toLocaleString("default", { month: "short" })} ${d.getDate()}`;
+  };
+  return `${short(mon)} – ${short(getSunday(mon))}`;
+};
+const dayOfWeek = dateStr => localDate(dateStr).getDay();
+
+const timeAgo = ms => {
+  if (!ms) return null;
+  const mins = Math.floor((Date.now() - ms) / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  return `${Math.floor(hrs / 24)}d ago`;
+};
+
+const entryKey = e => `${e.date}|${e.client}|${e.task}|${e.timeIn}|${e.timeOut}`;
+
+const parseAmPmTime = s => {
+  const m = /^(\d{1,2}):(\d{2})\s*(AM|PM)$/i.exec(String(s || "").trim());
+  if (!m) return null;
+  let h = Number(m[1]) % 12;
+  if (m[3].toUpperCase() === "PM") h += 12;
+  return `${PAD(h)}:${m[2]}`;
+};
+
+function parseEntriesCSV(text) {
+  const lines = text.split(/\r?\n/);
+  const headerIdx = lines.findIndex(l => l.replace(/"/g, "").trim().startsWith("Date,Client,Task"));
+  if (headerIdx === -1) throw new Error("Couldn't find an entries table in this file.");
+  let endIdx = lines.length;
+  for (let i = headerIdx + 1; i < lines.length; i++) {
+    if (lines[i].trim() === "") { endIdx = i; break; }
+  }
+  const chunk = lines.slice(headerIdx, endIdx).join("\n");
+  const { data } = Papa.parse(chunk, { header: true, skipEmptyLines: true });
+  return data;
+}
+
+function parseListSection(text, title) {
+  const lines = text.split(/\r?\n/);
+  const headerIdx = lines.findIndex(l => l.replace(/"/g, "").trim() === `--- ${title} ---`);
+  if (headerIdx === -1) return [];
+  const start = headerIdx + 2;
+  let end = lines.length;
+  for (let i = start; i < lines.length; i++) {
+    if (lines[i].trim() === "") { end = i; break; }
+  }
+  return lines.slice(start, end)
+    .map(l => l.trim().replace(/^"|"$/g, "").replace(/""/g, '"').trim())
+    .filter(Boolean);
+}
+
+/* ── Persistence (localStorage — standalone equivalent of window.storage) ── */
+
+const KEYS = {
+  entries: "tt_entries_v4",
+  increment: "tt_inc_v4",
+  clients: "tt_clients_v4",
+  tasks: "tt_tasks_v4",
+  lastExport: "tt_last_export_v1",
+  lastModified: "tt_last_modified_v1",
+};
+
+const store = {
+  async get(key, fallback) {
+    try {
+      const raw = localStorage.getItem(key);
+      return raw !== null ? JSON.parse(raw) : fallback;
+    } catch {
+      return fallback;
+    }
+  },
+  set(key, value) {
+    try {
+      localStorage.setItem(key, JSON.stringify(value));
+    } catch {
+      /* storage unavailable — app still works for this session */
+    }
+  },
+};
+
+function usePersist(key, value, enabled) {
+  useEffect(() => {
+    if (enabled) store.set(key, value);
+  }, [key, value, enabled]);
+}
+
+/* ── Styles ───────────────────────────────────────────────────────── */
+
+const INK = "#1a1a1a";
+const PAPER = "#f0efec";
+const RULE = "#ddd";
+
+const S = {
+  btnSm: { padding: "4px 10px", borderRadius: "4px", fontSize: "12px", cursor: "pointer", border: "0.5px solid #bbb", background: "transparent", color: "var(--color-text-primary)" },
+  btnDanger: { padding: "4px 10px", borderRadius: "4px", fontSize: "12px", cursor: "pointer", border: "0.5px solid #bbb", background: "transparent", color: "var(--color-text-danger)" },
+  btnPrimary: { padding: "8px 20px", borderRadius: "4px", fontSize: "14px", fontWeight: 600, cursor: "pointer", border: "none", background: INK, color: "#fff" },
+  btnSec: { padding: "8px 18px", borderRadius: "4px", fontSize: "14px", fontWeight: 500, cursor: "pointer", border: "0.5px solid #bbb", background: "transparent", color: "var(--color-text-primary)" },
+  table: { width: "100%", borderCollapse: "collapse", fontSize: "13px" },
+  th: { textAlign: "left", padding: "8px 6px", borderBottom: `1.5px solid ${INK}`, color: INK, fontWeight: 600, fontSize: "12px", background: "#e8e8e8" },
+  td: { padding: "6px 6px", borderBottom: `0.5px solid ${RULE}`, color: "var(--color-text-primary)", verticalAlign: "middle" },
+  tdTotal: { padding: "8px 6px", color: "var(--color-text-primary)", fontWeight: 600 },
+  label: { fontSize: "12px", color: "var(--color-text-secondary)", marginBottom: "4px" },
+  card: { background: "var(--color-background-primary)", border: `0.5px solid ${RULE}`, borderRadius: "6px", padding: "1.25rem", marginBottom: "1.25rem" },
+  grid2: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: "12px", marginBottom: "12px" },
+  grid3: { display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "12px", marginBottom: "12px" },
+  fill: { width: "100%", boxSizing: "border-box" },
+  muted: { fontSize: "13px", color: "var(--color-text-tertiary)" },
+  sectionHead: { fontSize: "15px", fontWeight: 600, color: INK, marginBottom: "10px" },
+  statCard: { background: PAPER, borderRadius: "6px", padding: "0.75rem 1rem" },
+  statLabel: { fontSize: "12px", color: "#555", marginBottom: "4px" },
+  statValue: { fontSize: "22px", fontWeight: 600, color: INK },
+  incOn: { padding: "4px 12px", fontSize: "12px", borderRadius: "4px", border: "none", background: INK, color: "#fff", cursor: "pointer", fontWeight: 600 },
+  incOff: { padding: "4px 12px", fontSize: "12px", borderRadius: "4px", border: "0.5px solid #bbb", background: "transparent", color: "#555", cursor: "pointer" },
+  tabOn: { padding: "10px 16px", fontSize: "13px", fontWeight: 500, color: "#fff", background: "#3a3a3a", border: "none", borderBottom: "2px solid #fff", cursor: "pointer" },
+  tabOff: { padding: "10px 16px", fontSize: "13px", fontWeight: 400, color: "#aaa", background: "transparent", border: "none", borderBottom: "2px solid transparent", cursor: "pointer" },
+  segOn: { padding: "5px 14px", fontSize: "13px", fontWeight: 500, borderRadius: "4px", border: "0.5px solid #bbb", background: INK, color: "#fff", cursor: "pointer" },
+  segOff: { padding: "5px 14px", fontSize: "13px", fontWeight: 400, borderRadius: "4px", border: "0.5px solid transparent", background: "transparent", color: "var(--color-text-secondary)", cursor: "pointer" },
+};
+
+/* ── Reusable inputs ──────────────────────────────────────────────── */
+
+function TimePicker({ value, onChange, increment }) {
+  const [h24, min] = value ? value.split(":").map(Number) : [null, null];
+  const ampm = h24 === null ? "AM" : h24 >= 12 ? "PM" : "AM";
+  const h12 = h24 === null ? "" : String(h24 % 12 || 12);
+
+  const emit = (hour, minute, meridiem) => {
+    if (hour === "" || minute === "") return;
+    const hh = (Number(hour) % 12) + (meridiem === "PM" ? 12 : 0);
+    onChange(`${PAD(hh)}:${PAD(Number(minute))}`);
+  };
+
+  const minutes = [];
+  for (let m = 0; m < 60; m += increment) minutes.push(m);
+  const sel = { fontSize: "14px", padding: "4px", boxSizing: "border-box" };
+
+  return (
+    <div style={{ display: "flex", gap: "4px", alignItems: "center" }}>
+      <select value={h12} onChange={e => emit(e.target.value, min ?? 0, ampm)} style={{ ...sel, width: "60px" }}>
+        <option value="">--</option>
+        {[1,2,3,4,5,6,7,8,9,10,11,12].map(h => <option key={h} value={h}>{h}</option>)}
+      </select>
+      <span style={{ fontSize: "14px", color: "var(--color-text-secondary)" }}>:</span>
+      <select value={min ?? ""} onChange={e => emit(h12, e.target.value, ampm)} style={{ ...sel, width: "60px" }}>
+        <option value="">--</option>
+        {minutes.map(m => <option key={m} value={m}>{PAD(m)}</option>)}
+      </select>
+      <select value={ampm} onChange={e => emit(h12, min ?? 0, e.target.value)} style={{ ...sel, width: "56px" }}>
+        <option value="AM">AM</option>
+        <option value="PM">PM</option>
+      </select>
+    </div>
+  );
+}
+
+function ComboInput({ value, onChange, options, placeholder, disabled }) {
+  const id = `dl-${placeholder.replace(/\s/g, "")}`;
+  return (
+    <div>
+      <input list={id} value={value} onChange={e => onChange(e.target.value)}
+        placeholder={placeholder} disabled={disabled} style={S.fill} />
+      <datalist id={id}>{options.map(o => <option key={o} value={o} />)}</datalist>
+    </div>
+  );
+}
+
+function EditableCell({ value, display, type = "text", options = [], onChange }) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(value);
+  const ref = useRef();
+
+  useEffect(() => { if (editing) ref.current?.focus(); }, [editing]);
+
+  const commit = () => {
+    setEditing(false);
+    if (draft !== value) onChange(draft);
+  };
+
+  if (!editing) {
+    return (
+      <span onClick={() => { setDraft(value); setEditing(true); }}
+        style={{ cursor: "pointer", borderBottom: "1px dashed var(--color-border-secondary)", paddingBottom: "1px" }}>
+        {display ?? value}
+      </span>
+    );
+  }
+  if (options.length) {
+    return (
+      <select ref={ref} value={draft} onChange={e => setDraft(e.target.value)} onBlur={commit}
+        style={{ fontSize: "13px", width: "100%" }}>
+        {options.map(o => <option key={o} value={o}>{o}</option>)}
+      </select>
+    );
+  }
+  return (
+    <input ref={ref} type={type} value={draft} onChange={e => setDraft(e.target.value)}
+      onBlur={commit} onKeyDown={e => e.key === "Enter" && commit()}
+      style={{ fontSize: "13px", ...S.fill }} />
+  );
+}
+
+function EditableListItem({ value, onSave, onDelete }) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(value);
+  const ref = useRef();
+  const busy = useRef(false);
+
+  useEffect(() => { if (editing) ref.current?.focus(); }, [editing]);
+
+  const commit = () => {
+    if (busy.current) return;
+    busy.current = true;
+    setEditing(false);
+    const next = draft.trim();
+    if (next && next !== value) onSave(next);
+    setTimeout(() => { busy.current = false; }, 100);
+  };
+
+  const onKeyDown = e => {
+    if (e.key === "Enter") { e.preventDefault(); commit(); }
+    if (e.key === "Escape") { e.preventDefault(); setEditing(false); setDraft(value); }
+  };
+
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: "8px", padding: "6px 0", borderBottom: `0.5px solid ${RULE}` }}>
+      {editing
+        ? <input ref={ref} value={draft} onChange={e => setDraft(e.target.value)} onKeyDown={onKeyDown}
+            style={{ flex: 1, fontSize: "14px", boxSizing: "border-box" }} />
+        : <span style={{ flex: 1, fontSize: "14px", color: "var(--color-text-primary)" }}>{value}</span>}
+      {editing
+        ? <button style={S.btnSm} onClick={commit}>Save</button>
+        : <button style={S.btnSm} onClick={() => { setDraft(value); setEditing(true); }}>Edit</button>}
+      <button style={S.btnDanger} onClick={onDelete}>Remove</button>
+    </div>
+  );
+}
+
+// Guards a confirm button against being tapped in the same instant it appears
+// (e.g. a double-tap landing on the button that just replaced what was tapped).
+function DelayedConfirm({ ms = 400, children }) {
+  const [ready, setReady] = useState(false);
+  useEffect(() => {
+    const t = setTimeout(() => setReady(true), ms);
+    return () => clearTimeout(t);
+  }, []);
+  return children(ready);
+}
+
+/* ── File download ────────────────────────────────────────────────── */
+
+function download(filename, content, mime) {
+  const url = URL.createObjectURL(new Blob([content], { type: mime }));
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => { a.remove(); URL.revokeObjectURL(url); }, 1000);
+}
+
+/* ── Timecard builder ─────────────────────────────────────────────── */
+
+const BLACK = "#1a1a1a", DGRAY = "#4a4a4a", LTGRAY = "#e8e8e8", WHITE = "#fff";
+const DAY_LABELS = ["Su", "M", "T", "W", "T", "F", "Sa"];
+
+const esc = s => String(s ?? "").replace(/[&<>"]/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[ch]));
+
+const cell = (content = "", { bg = WHITE, fg = "", align = "left", bold = false, span = 1, extra = "" } = {}) =>
+  `<td colspan="${span}" style="border:1.5px solid #000;font-size:11px;padding:5px 6px;` +
+  `background:${bg};text-align:${align};${bold ? "font-weight:bold;" : ""}${fg ? `color:${fg};` : ""}${extra}">${content}</td>`;
+
+const row = cells => `<tr>${cells.join("")}</tr>`;
+const headCell = (text, span = 1, align = "left") => cell(text, { bg: BLACK, fg: "#fff", bold: true, span, align });
+const colCell = (text, align = "left") => cell(text, { bg: DGRAY, fg: "#fff", bold: true, align });
+
+function buildTimecard(weekEntries, weekEnd, employee) {
+  const dayTotals = [0, 0, 0, 0, 0, 0, 0];
+  weekEntries.forEach(e => { dayTotals[dayOfWeek(e.date)] += e.duration; });
+  const weekTotal = dayTotals.reduce((s, v) => s + v, 0);
+  const hrs = mins => (mins / 60).toFixed(4);
+  const rowCount = Math.max(20, weekEntries.length);
+
+  const rows = [
+    row([headCell("Weekly Time Card", 2), headCell("", 12)]),
+    row([
+      headCell("Employees Name:"), headCell(""),
+      headCell(esc(employee), 2), headCell("", 3),
+      headCell("Week Ending:", 1, "center"),
+      headCell(weekEnd, 3, "center"),
+      headCell("Date", 2, "center"),
+    ]),
+    row([
+      colCell("Job Name"), colCell("#", "center"), colCell("Type of Work"),
+      colCell("Time In", "center"), colCell("Time Out", "center"),
+      ...DAY_LABELS.map(d => colCell(d, "center")),
+      colCell("HRS/Job", "center"), colCell("Code/Amount", "center"),
+    ]),
+  ];
+
+  for (let i = 0; i < rowCount; i++) {
+    const e = weekEntries[i];
+    const bg = i % 2 === 0 ? WHITE : LTGRAY;
+    const day = e ? dayOfWeek(e.date) : -1;
+    const value = e ? hrs(e.duration) : "";
+    rows.push(row([
+      cell(e ? esc(e.client) : "", { bg }),
+      cell(i + 1, { bg, align: "center" }),
+      cell(e ? esc(e.task) : "", { bg }),
+      cell(e ? fmt12(e.timeIn) : "", { bg, align: "center" }),
+      cell(e ? fmt12(e.timeOut) : "", { bg, align: "center" }),
+      ...DAY_LABELS.map((_, d) => cell(day === d ? value : "", { bg, align: "center" })),
+      cell(value, { bg, align: "center" }),
+      cell("", { bg }),
+    ]));
+  }
+
+  rows.push(row([
+    cell("Aum Construction, Inc.<br>Post Office Box 1033<br>Mendocino, CA 95460",
+      { span: 3, extra: "font-size:10px;vertical-align:top;" }),
+    cell("", { bg: BLACK, span: 2 }),
+    ...dayTotals.map(m => cell(m > 0 ? hrs(m) : "", { bg: BLACK, fg: "#fff", bold: true, align: "center" })),
+    cell(hrs(weekTotal), { bg: BLACK, fg: "#fff", bold: true, align: "center" }),
+    cell("", { bg: BLACK }),
+  ]));
+
+  rows.push(row([cell("Total Overtime", { span: 2 }), cell("", { span: 12 })]));
+
+  const sigLine = "border-bottom:2px solid #000;";
+  rows.push(row([
+    cell("Signature:"), cell("", { span: 5, extra: sigLine }),
+    cell("Date:"), cell("", { span: 6, extra: sigLine }),
+  ]));
+
+  return `<html xmlns:o="urn:schemas-microsoft-com:office:office" ` +
+    `xmlns:x="urn:schemas-microsoft-com:office:excel" xmlns="http://www.w3.org/TR/REC-html40">` +
+    `<head><meta charset="UTF-8"><!--[if gte mso 9]><xml><x:ExcelWorkbook><x:ExcelWorksheets>` +
+    `<x:ExcelWorksheet><x:Name>Time Card</x:Name></x:ExcelWorksheet></x:ExcelWorksheets>` +
+    `</x:ExcelWorkbook></xml><![endif]--></head><body>` +
+    `<table style="border-collapse:collapse;font-family:Arial,sans-serif;width:100%;">${rows.join("")}</table>` +
+    `</body></html>`;
+}
+
+/* ── Main app ─────────────────────────────────────────────────────── */
+
+const EMPLOYEE = "Sunny Chancellor";
+const TABS = ["track", "summary", "lists"];
+const cap = s => s.charAt(0).toUpperCase() + s.slice(1);
+
+function App() {
+  const [entries, setEntries] = useState([]);
+  const [clients, setClients] = useState([]);
+  const [tasks, setTasks] = useState([]);
+  const [increment, setIncrement] = useState(15);
+  const [loaded, setLoaded] = useState(false);
+
+  const [tab, setTab] = useState("track");
+  const [sumView, setSumView] = useState("client");
+
+  const [form, setForm] = useState({ client: "", task: "", date: fmtDate(new Date()), in: "", out: "" });
+  const [formErr, setFormErr] = useState("");
+  const setFormField = (key, val) => setForm(f => ({ ...f, [key]: val }));
+
+  const [running, setRunning] = useState(false);
+  const [startedAt, setStartedAt] = useState(null);
+  const [elapsed, setElapsed] = useState(0);
+  const [timerClient, setTimerClient] = useState("");
+  const [timerTask, setTimerTask] = useState("");
+
+  const [newClient, setNewClient] = useState("");
+  const [newTask, setNewTask] = useState("");
+  const [tcWeek, setTcWeek] = useState(() => getMonday(fmtDate(new Date())));
+  const [logWeek, setLogWeek] = useState(() => getMonday(fmtDate(new Date())));
+  const [purgeBefore, setPurgeBefore] = useState("");
+  const [confirmPurge, setConfirmPurge] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(null); // { label, item, usage } | null
+  const [confirmDeleteId, setConfirmDeleteId] = useState(null);
+
+  const [lastExportAt, setLastExportAt] = useState(null);
+  const [lastModifiedAt, setLastModifiedAt] = useState(null);
+  const [importMsg, setImportMsg] = useState("");
+  const [importing, setImporting] = useState(false);
+  const fileInputRef = useRef(null);
+  const didInit = useRef(false);
+
+  useEffect(() => {
+    (async () => {
+      const [e, i, c, t, le, lm] = await Promise.all([
+        store.get(KEYS.entries, []),
+        store.get(KEYS.increment, 15),
+        store.get(KEYS.clients, []),
+        store.get(KEYS.tasks, []),
+        store.get(KEYS.lastExport, null),
+        store.get(KEYS.lastModified, null),
+      ]);
+      setEntries(e);
+      setIncrement(Number(i) || 15);
+      setClients(c);
+      setTasks(t);
+      setLastExportAt(le);
+      setLastModifiedAt(lm);
+      setLoaded(true);
+    })();
+  }, []);
+
+  usePersist(KEYS.entries, entries, loaded);
+  usePersist(KEYS.increment, increment, loaded);
+  usePersist(KEYS.clients, clients, loaded);
+  usePersist(KEYS.tasks, tasks, loaded);
+  usePersist(KEYS.lastExport, lastExportAt, loaded);
+  usePersist(KEYS.lastModified, lastModifiedAt, loaded);
+
+  useEffect(() => {
+    if (!loaded) return;
+    if (!didInit.current) { didInit.current = true; return; }
+    setLastModifiedAt(Date.now());
+  }, [entries, clients, tasks, loaded]);
+
+  const dirty = entries.length > 0 && (!lastExportAt || (lastModifiedAt && lastModifiedAt > lastExportAt));
+
+  useEffect(() => {
+    if (!running) return;
+    const id = setInterval(() => setElapsed(Math.floor((Date.now() - startedAt) / 1000)), 1000);
+    return () => clearInterval(id);
+  }, [running, startedAt]);
+
+  const calcDuration = useCallback(
+    rawMins => Math.max(increment, Math.round(rawMins / increment) * increment),
+    [increment]
+  );
+
+  const remember = useCallback((client, task) => {
+    const c = client.trim(), t = task.trim();
+    if (c) setClients(p => (p.includes(c) ? p : [...p, c].sort()));
+    if (t) setTasks(p => (p.includes(t) ? p : [...p, t].sort()));
+  }, []);
+
+  const addEntry = entry => setEntries(p => [{ id: Date.now(), ...entry }, ...p]);
+
+  function startTimer() {
+    if (running || !form.client.trim() || !form.task.trim()) return;
+    const c = form.client.trim(), t = form.task.trim();
+    remember(c, t);
+    setTimerClient(c);
+    setTimerTask(t);
+    setStartedAt(Date.now());
+    setElapsed(0);
+    setRunning(true);
+  }
+
+  function stopTimer() {
+    setRunning(false);
+    const now = new Date(), start = new Date(startedAt);
+    addEntry({
+      client: timerClient,
+      task: timerTask,
+      date: fmtDate(start),
+      timeIn: clockOf(start),
+      timeOut: clockOf(now),
+      duration: calcDuration(Math.round(elapsed / 60)),
+    });
+    setElapsed(0);
+    setStartedAt(null);
+    setTimerClient("");
+    setTimerTask("");
+  }
+
+  function addManual() {
+    setFormErr("");
+    const { client, task, date, in: tIn, out: tOut } = form;
+    if (!client.trim() || !task.trim() || !date || !tIn || !tOut) {
+      setFormErr("Please fill in all fields.");
+      return;
+    }
+    const mins = toMins(tOut) - toMins(tIn);
+    if (mins <= 0) {
+      setFormErr("Time out must be after time in.");
+      return;
+    }
+    remember(client, task);
+    addEntry({ client, task, date, timeIn: tIn, timeOut: tOut, duration: calcDuration(mins) });
+    setForm({ client: "", task: "", date: fmtDate(new Date()), in: "", out: "" });
+  }
+
+  function updateEntry(id, field, value) {
+    if (field === "client") remember(value, "");
+    if (field === "task") remember("", value);
+    setEntries(p => p.map(e => {
+      if (e.id !== id) return e;
+      const next = { ...e, [field]: value };
+      if (field === "timeIn" || field === "timeOut") {
+        const mins = toMins(next.timeOut) - toMins(next.timeIn);
+        if (mins > 0) next.duration = calcDuration(mins);
+      }
+      return next;
+    }));
+  }
+
+  const deleteEntry = id => setEntries(p => p.filter(e => e.id !== id));
+
+  function shiftWeek(delta) {
+    setLogWeek(prev => {
+      const d = localDate(prev);
+      d.setDate(d.getDate() + 7 * delta);
+      return fmtDate(d);
+    });
+  }
+
+  const purgeCount = purgeBefore ? entries.filter(e => e.date < purgeBefore).length : 0;
+
+  function purgeOldEntries() {
+    setEntries(p => p.filter(e => e.date >= purgeBefore));
+    setPurgeBefore("");
+    setConfirmPurge(false);
+  }
+
+  function renameInList(label, from, to) {
+    const key = label === "Clients" ? "client" : "task";
+    const setList = label === "Clients" ? setClients : setTasks;
+    setList(p => (p.includes(to) ? p : p.map(x => (x === from ? to : x)).sort()));
+    setEntries(p => p.map(e => (e[key] === from ? { ...e, [key]: to } : e)));
+  }
+
+  function exportCSV() {
+    const sorted = [...entries].sort((a, b) =>
+      a.date.localeCompare(b.date) || a.timeIn.localeCompare(b.timeIn));
+
+    const rows = [["Date", "Client", "Task", "Time In", "Time Out", "Duration (HH:MM)"]];
+    sorted.forEach(e =>
+      rows.push([e.date, e.client, e.task, fmt12(e.timeIn), fmt12(e.timeOut), minsToHHMM(e.duration)]));
+
+    const section = (title, grouped) => {
+      rows.push([], [`--- ${title} ---`], ["Group", "Duration"]);
+      Object.entries(grouped)
+        .sort((a, b) => b[1] - a[1])
+        .forEach(([k, m]) => rows.push([k, minsToHHMM(m)]));
+      rows.push(["TOTAL", minsToHHMM(Object.values(grouped).reduce((s, v) => s + v, 0))]);
+    };
+
+    const groupBy = fn => sorted.reduce((acc, e) => {
+      const k = fn(e);
+      acc[k] = (acc[k] || 0) + e.duration;
+      return acc;
+    }, {});
+
+    section("BY CLIENT", groupBy(e => e.client));
+    section("BY TASK", groupBy(e => e.task));
+    section("BY WEEK", groupBy(e => weekLabel(getMonday(e.date))));
+
+    rows.push([], ["--- CLIENTS ---"], ["Client"]);
+    clients.forEach(c => rows.push([c]));
+    rows.push([], ["--- TASKS ---"], ["Task"]);
+    tasks.forEach(t => rows.push([t]));
+
+    const csv = rows.map(r => r.map(v => `"${String(v).replace(/"/g, '""')}"`).join(",")).join("\n");
+    download(`time_log_${fmtDate(new Date())}.csv`, csv, "text/csv");
+    setLastExportAt(Date.now());
+  }
+
+  async function handleImportFile(file) {
+    setImporting(true);
+    setImportMsg("");
+    try {
+      const text = await file.text();
+      const rows = parseEntriesCSV(text);
+      const existingKeys = new Set(entries.map(entryKey));
+      const seenClients = new Set(clients);
+      const seenTasks = new Set(tasks);
+      const toAdd = [];
+      let skipped = 0, unreadable = 0;
+
+      rows.forEach((r, i) => {
+        const date = (r["Date"] || "").trim();
+        const client = (r["Client"] || "").trim();
+        const task = (r["Task"] || "").trim();
+        const timeIn = parseAmPmTime(r["Time In"]);
+        const timeOut = parseAmPmTime(r["Time Out"]);
+        const durStr = (r["Duration (HH:MM)"] || "").trim();
+        const durMatch = /^(\d+):(\d{2})$/.exec(durStr);
+        if (!date || !client || !task || !timeIn || !timeOut || !durMatch) { unreadable++; return; }
+
+        const key = `${date}|${client}|${task}|${timeIn}|${timeOut}`;
+        if (existingKeys.has(key)) { skipped++; return; }
+        existingKeys.add(key);
+
+        toAdd.push({
+          id: Date.now() + i,
+          date, client, task, timeIn, timeOut,
+          duration: Number(durMatch[1]) * 60 + Number(durMatch[2]),
+        });
+        seenClients.add(client);
+        seenTasks.add(task);
+      });
+
+      if (toAdd.length) setEntries(p => [...toAdd, ...p]);
+
+      parseListSection(text, "CLIENTS").forEach(c => seenClients.add(c));
+      parseListSection(text, "TASKS").forEach(t => seenTasks.add(t));
+      const clientsGained = seenClients.size - clients.length;
+      const tasksGained = seenTasks.size - tasks.length;
+      setClients([...seenClients].sort());
+      setTasks([...seenTasks].sort());
+
+      const parts = [`${toAdd.length} ${toAdd.length === 1 ? "entry" : "entries"} imported`];
+      if (skipped) parts.push(`${skipped} duplicate${skipped === 1 ? "" : "s"} skipped`);
+      if (unreadable) parts.push(`${unreadable} row${unreadable === 1 ? "" : "s"} unreadable`);
+      if (clientsGained > 0) parts.push(`${clientsGained} new client${clientsGained === 1 ? "" : "s"}`);
+      if (tasksGained > 0) parts.push(`${tasksGained} new task${tasksGained === 1 ? "" : "s"}`);
+      setImportMsg(parts.join(" — "));
+    } catch (err) {
+      setImportMsg(`Import failed: ${err.message}`);
+    } finally {
+      setImporting(false);
+    }
+  }
+
+  function exportTimecard() {
+    try {
+      const start = tcWeek || getMonday(fmtDate(new Date()));
+      const end = getSunday(start);
+      const weekEntries = entries
+        .filter(e => e.date >= start && e.date <= end)
+        .sort((a, b) => a.date.localeCompare(b.date) || a.timeIn.localeCompare(b.timeIn));
+      download(`timecard_${start}.xls`, buildTimecard(weekEntries, end, EMPLOYEE),
+        "application/vnd.ms-excel;charset=utf-8");
+    } catch (err) {
+      alert(`Export error: ${err.message}`);
+    }
+  }
+
+  const totalMins = entries.reduce((s, e) => s + e.duration, 0);
+  const weekEntries = entries.filter(e => e.date >= logWeek && e.date <= getSunday(logWeek));
+  const tally = fn => entries.reduce((acc, e) => {
+    const k = fn(e);
+    acc[k] = (acc[k] || 0) + e.duration;
+    return acc;
+  }, {});
+  const summaries = {
+    client: tally(e => e.client),
+    task: tally(e => e.task),
+    week: tally(e => getMonday(e.date)),
+  };
+
+  const elapsedClock = [Math.floor(elapsed / 3600), Math.floor((elapsed % 3600) / 60), elapsed % 60]
+    .map(PAD).join(":");
+
+  function SummaryTable({ data, keyLabel }) {
+    const rows = Object.entries(data)
+      .sort((a, b) => (keyLabel === "week" ? a[0].localeCompare(b[0]) : b[1] - a[1]));
+    if (!rows.length) return <p style={S.muted}>No data yet.</p>;
+    const total = rows.reduce((s, [, m]) => s + m, 0);
+    return (
+      <table style={S.table}>
+        <thead><tr><th style={S.th}>{cap(keyLabel)}</th><th style={S.th}>Duration</th></tr></thead>
+        <tbody>
+          {rows.map(([k, m]) => (
+            <tr key={k}>
+              <td style={S.td}>{keyLabel === "week" ? weekLabel(k) : k}</td>
+              <td style={S.td}>{minsToHHMM(m)}</td>
+            </tr>
+          ))}
+        </tbody>
+        <tfoot>
+          <tr style={{ borderTop: `1.5px solid ${INK}`, background: "#e8e8e8" }}>
+            <td style={S.tdTotal}>Total</td>
+            <td style={S.tdTotal}>{minsToHHMM(total)}</td>
+          </tr>
+        </tfoot>
+      </table>
+    );
+  }
+
+  const lists = [
+    { label: "Clients", items: clients, setItems: setClients, draft: newClient, setDraft: setNewClient },
+    { label: "Tasks", items: tasks, setItems: setTasks, draft: newTask, setDraft: setNewTask },
+  ];
+
+  const addToList = ({ items, setItems, draft, setDraft }) => {
+    const v = draft.trim();
+    if (!v || items.includes(v)) return;
+    setItems(p => [...p, v].sort());
+    setDraft("");
+  };
+
+  return (
+    <div style={{ fontFamily: "var(--font-sans)", background: "var(--color-background-primary)", borderRadius: "8px", overflow: "hidden", margin: "0.75rem" }}>
+
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: "8px", padding: "0.9rem 1.25rem", background: PAPER }}>
+        <p style={{ fontSize: "18px", fontWeight: 600, color: INK, margin: 0 }}>Time tracker</p>
+        <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+          <span style={{ fontSize: "12px", color: "#555", marginRight: "2px" }}>Increment:</span>
+          {[5, 10, 15].map(v => (
+            <button key={v} style={increment === v ? S.incOn : S.incOff} onClick={() => setIncrement(v)}>{v} min</button>
+          ))}
+        </div>
+      </div>
+
+      <div style={{ display: "flex", background: INK, flexWrap: "wrap" }}>
+        {TABS.map(t => (
+          <button key={t} style={tab === t ? S.tabOn : S.tabOff} onClick={() => setTab(t)}>{cap(t)}</button>
+        ))}
+      </div>
+
+      <div style={{
+        display: "flex", alignItems: "center", justifyContent: "space-between", gap: "8px",
+        padding: "6px 1.25rem", fontSize: "12px", borderBottom: `0.5px solid ${RULE}`,
+        background: entries.length === 0 ? PAPER : dirty ? "#fdf3e3" : "#eaf6ec",
+        color: entries.length === 0 ? "#777" : dirty ? "#8a5a00" : "#2e7d43",
+      }}>
+        <span>
+          {entries.length === 0
+            ? "No entries yet"
+            : !lastExportAt
+              ? "Not backed up yet"
+              : dirty
+                ? `New changes since last backup (${timeAgo(lastExportAt)})`
+                : `Backed up ${timeAgo(lastExportAt)}`}
+        </span>
+        {dirty && entries.length > 0 && (
+          <button onClick={exportCSV}
+            style={{ ...S.btnSm, borderColor: "#c9a35f", color: "#8a5a00", background: "transparent" }}>
+            Export now
+          </button>
+        )}
+      </div>
+
+      <div style={{ padding: "1.25rem" }}>
+
+        {tab === "track" && (
+          <div>
+            <div style={S.card}>
+              <div style={S.grid2}>
+                <div>
+                  <div style={S.label}>Client</div>
+                  <ComboInput value={form.client} onChange={v => setFormField("client", v)} options={clients} placeholder="Client name" />
+                </div>
+                <div>
+                  <div style={S.label}>Task</div>
+                  <ComboInput value={form.task} onChange={v => setFormField("task", v)} options={tasks} placeholder="Task description" />
+                </div>
+              </div>
+              <div style={S.grid3}>
+                <div>
+                  <div style={S.label}>Date</div>
+                  <input type="date" value={form.date} onChange={e => setFormField("date", e.target.value)} style={S.fill} />
+                </div>
+                <div>
+                  <div style={S.label}>Time in</div>
+                  <TimePicker value={form.in} onChange={v => setFormField("in", v)} increment={increment} />
+                </div>
+                <div>
+                  <div style={S.label}>Time out</div>
+                  <TimePicker value={form.out} onChange={v => setFormField("out", v)} increment={increment} />
+                </div>
+              </div>
+              {formErr && <div style={{ fontSize: "13px", color: "var(--color-text-danger)", marginBottom: "8px" }}>{formErr}</div>}
+
+              <div style={{ display: "flex", gap: "10px", alignItems: "center", flexWrap: "wrap" }}>
+                <button style={S.btnPrimary} onClick={addManual}>Add entry</button>
+                {!running ? (
+                  <button style={S.btnSec} onClick={startTimer} disabled={!form.client.trim() || !form.task.trim()}>
+                    Start timer
+                  </button>
+                ) : (
+                  <div style={{ display: "flex", alignItems: "center", gap: "10px", background: "#eaf6ec", padding: "6px 12px", borderRadius: "4px" }}>
+                    <span style={{ fontSize: "13px", color: "#2e7d43", fontVariantNumeric: "tabular-nums" }}>
+                      ⏱ {timerClient} · {timerTask} · {elapsedClock}
+                    </span>
+                    <button onClick={stopTimer} style={{ ...S.btnSm, background: "#c0392b", color: "#fff", border: "none" }}>
+                      Stop &amp; save
+                    </button>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "12px", flexWrap: "wrap", gap: "8px" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                <button style={S.btnSm} onClick={() => shiftWeek(-1)}>‹ Prev</button>
+                <span style={{ fontSize: "13px", fontWeight: 600, color: INK }}>{weekLabel(logWeek)}</span>
+                <button style={S.btnSm} onClick={() => shiftWeek(1)}>Next ›</button>
+                {logWeek !== getMonday(fmtDate(new Date())) && (
+                  <button style={S.btnSm} onClick={() => setLogWeek(getMonday(fmtDate(new Date())))}>This week</button>
+                )}
+              </div>
+              <input type="date" value={logWeek} onChange={e => setLogWeek(getMonday(e.target.value))} style={{ fontSize: "12px" }} />
+            </div>
+
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px" }}>
+              <span style={{ fontSize: "13px", color: "var(--color-text-secondary)" }}>
+                {weekEntries.length} {weekEntries.length === 1 ? "entry" : "entries"} this week — click any cell to edit
+              </span>
+            </div>
+            {weekEntries.length === 0
+              ? <p style={{ color: "var(--color-text-tertiary)", fontSize: "14px" }}>No entries for this week.</p>
+              : (
+                <div style={{ overflowX: "auto" }}>
+                  <table style={S.table}>
+                    <thead>
+                      <tr>{["Date", "Client", "Task", "Time in", "Time out", "Duration", ""].map(h => <th key={h} style={S.th}>{h}</th>)}</tr>
+                    </thead>
+                    <tbody>
+                      {weekEntries.map(e => (
+                        <tr key={e.id} style={confirmDeleteId === e.id ? { background: "#fdecea" } : undefined}>
+                          <td style={S.td}><EditableCell value={e.date} type="date" onChange={v => updateEntry(e.id, "date", v)} /></td>
+                          <td style={S.td}><EditableCell value={e.client} options={clients} onChange={v => updateEntry(e.id, "client", v)} /></td>
+                          <td style={S.td}><EditableCell value={e.task} options={tasks} onChange={v => updateEntry(e.id, "task", v)} /></td>
+                          <td style={S.td}><EditableCell value={e.timeIn} display={fmt12(e.timeIn)} type="time" onChange={v => updateEntry(e.id, "timeIn", v)} /></td>
+                          <td style={S.td}><EditableCell value={e.timeOut} display={fmt12(e.timeOut)} type="time" onChange={v => updateEntry(e.id, "timeOut", v)} /></td>
+                          <td style={S.td}>{minsToHHMM(e.duration)}</td>
+                          <td style={S.td}>
+                            {confirmDeleteId === e.id ? (
+                              <span style={{ display: "flex", gap: "4px", justifyContent: "flex-end" }}>
+                                <DelayedConfirm>
+                                  {ready => (
+                                    <button
+                                      disabled={!ready}
+                                      onClick={() => { deleteEntry(e.id); setConfirmDeleteId(null); }}
+                                      title="Confirm delete"
+                                      style={{ background: ready ? "#c0392b" : "#e6b3ac", border: "none", color: "#fff", borderRadius: "3px", cursor: ready ? "pointer" : "default", fontSize: "12px", padding: "2px 6px" }}
+                                    >✓</button>
+                                  )}
+                                </DelayedConfirm>
+                                <button onClick={() => setConfirmDeleteId(null)} title="Cancel"
+                                  style={{ background: "none", border: "0.5px solid #bbb", color: "var(--color-text-secondary)", borderRadius: "3px", cursor: "pointer", fontSize: "12px", padding: "2px 6px" }}>✕</button>
+                              </span>
+                            ) : (
+                              <button onClick={() => setConfirmDeleteId(e.id)} aria-label="Delete entry"
+                                style={{ background: "none", border: "none", cursor: "pointer", fontSize: "15px", color: "var(--color-text-tertiary)", padding: "0 2px" }}>×</button>
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+
+            <div style={{ marginTop: "1.5rem", borderTop: `0.5px solid ${RULE}`, paddingTop: "1.25rem" }}>
+              <p style={{ fontSize: "14px", fontWeight: 600, color: INK, marginBottom: "4px" }}>Purge old entries</p>
+              <p style={{ ...S.muted, marginBottom: "10px" }}>
+                Permanently remove entries dated before a given date. Make sure they're backed up (Summary tab) first — this can't be undone.
+              </p>
+              <div style={{ display: "flex", gap: "10px", alignItems: "center", flexWrap: "wrap" }}>
+                <input type="date" value={purgeBefore} onChange={e => { setPurgeBefore(e.target.value); setConfirmPurge(false); }} style={{ fontSize: "13px" }} />
+                {!confirmPurge ? (
+                  <button
+                    style={{ ...S.btnSec, borderColor: "#c0392b", color: "#c0392b" }}
+                    onClick={() => { if (purgeBefore && purgeCount > 0) setConfirmPurge(true); }}
+                    disabled={!purgeBefore || purgeCount === 0}
+                  >
+                    {purgeBefore ? `Purge ${purgeCount} ${purgeCount === 1 ? "entry" : "entries"}` : "Purge…"}
+                  </button>
+                ) : (
+                  <span style={{ display: "flex", alignItems: "center", gap: "8px", background: "#fdecea", padding: "6px 10px", borderRadius: "4px" }}>
+                    <span style={{ fontSize: "12px", color: "#c0392b" }}>
+                      Really delete {purgeCount} {purgeCount === 1 ? "entry" : "entries"} before {purgeBefore}? This can't be undone.
+                    </span>
+                    <DelayedConfirm>
+                      {ready => (
+                        <button
+                          disabled={!ready}
+                          onClick={purgeOldEntries}
+                          style={{ background: ready ? "#c0392b" : "#e6b3ac", border: "none", color: "#fff", borderRadius: "3px", cursor: ready ? "pointer" : "default", fontSize: "12px", padding: "4px 8px" }}
+                        >
+                          Yes, purge
+                        </button>
+                      )}
+                    </DelayedConfirm>
+                    <button onClick={() => setConfirmPurge(false)} style={S.btnSm}>Cancel</button>
+                  </span>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {tab === "summary" && (
+          <div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "12px", marginBottom: "1.25rem" }}>
+              <div style={S.statCard}>
+                <div style={S.statLabel}>Total time</div>
+                <div style={S.statValue}>{minsToHHMM(totalMins)}</div>
+              </div>
+              <div style={S.statCard}>
+                <div style={S.statLabel}>Total entries</div>
+                <div style={S.statValue}>{entries.length}</div>
+              </div>
+            </div>
+
+            <div style={{ display: "flex", gap: "4px", marginBottom: "1.25rem", background: PAPER, padding: "4px", borderRadius: "4px", width: "fit-content" }}>
+              {["client", "task", "week"].map(v => (
+                <button key={v} style={sumView === v ? S.segOn : S.segOff} onClick={() => setSumView(v)}>{cap(v)}</button>
+              ))}
+            </div>
+
+            <SummaryTable data={summaries[sumView]} keyLabel={sumView} />
+
+            <div style={{ marginTop: "1.5rem", borderTop: `0.5px solid ${RULE}`, paddingTop: "1.25rem" }}>
+              <p style={{ fontSize: "14px", fontWeight: 600, color: INK, marginBottom: "10px" }}>Export timecard</p>
+              <div style={{ display: "flex", gap: "10px", alignItems: "flex-end", flexWrap: "wrap" }}>
+                <div>
+                  <div style={S.statLabel}>Week starting (Monday)</div>
+                  <input type="date" value={tcWeek} onChange={e => setTcWeek(getMonday(e.target.value))} style={{ fontSize: "13px" }} />
+                </div>
+                <button style={S.btnSec} onClick={exportCSV}>Export CSV</button>
+                <button style={S.btnPrimary} onClick={exportTimecard}>Export Timecard (.xls)</button>
+              </div>
+            </div>
+
+            <div style={{ marginTop: "1.5rem", borderTop: `0.5px solid ${RULE}`, paddingTop: "1.25rem" }}>
+              <p style={{ fontSize: "14px", fontWeight: 600, color: INK, marginBottom: "4px" }}>Backup &amp; restore</p>
+              <p style={{ ...S.muted, marginBottom: "10px" }}>
+                Export CSV regularly and save the file somewhere you control — that's your real backup.
+                If this app's data is ever lost, import that same CSV to restore it.
+              </p>
+              <div style={{ display: "flex", gap: "10px", alignItems: "center", flexWrap: "wrap" }}>
+                <button style={S.btnSec} disabled={importing} onClick={() => fileInputRef.current?.click()}>
+                  {importing ? "Importing…" : "Import CSV"}
+                </button>
+                <button style={S.btnSec} onClick={exportCSV}>Export CSV</button>
+                <input ref={fileInputRef} type="file" accept=".csv" style={{ display: "none" }}
+                  onChange={e => { const f = e.target.files[0]; if (f) handleImportFile(f); e.target.value = ""; }} />
+              </div>
+              {importMsg && <p style={{ fontSize: "12px", color: "var(--color-text-secondary)", marginTop: "8px" }}>{importMsg}</p>}
+            </div>
+          </div>
+        )}
+
+        {tab === "lists" && (
+          <div>
+            {lists.map(list => (
+              <div key={list.label} style={{ marginBottom: "2rem" }}>
+                <p style={S.sectionHead}>{list.label} ({list.items.length})</p>
+                {list.items.length === 0 && <p style={S.muted}>No {list.label.toLowerCase()} yet.</p>}
+                {list.items.map(item => {
+                  const field = list.label === "Clients" ? "client" : "task";
+                  const usage = entries.filter(e => e[field] === item).length;
+                  const pending = confirmDelete?.label === list.label && confirmDelete?.item === item;
+
+                  if (pending) {
+                    return (
+                      <div key={item} style={{ display: "flex", alignItems: "center", gap: "8px", padding: "8px 0", borderBottom: `0.5px solid ${RULE}`, background: "#fdf3e3" }}>
+                        <span style={{ flex: 1, fontSize: "13px", color: "#8a5a00" }}>
+                          {usage > 0
+                            ? `"${item}" is used in ${usage} ${usage === 1 ? "entry" : "entries"} — removing it won't delete those entries. Remove anyway?`
+                            : `Remove "${item}" from the list?`}
+                        </span>
+                        <DelayedConfirm>
+                          {ready => (
+                            <button
+                              disabled={!ready}
+                              onClick={() => { list.setItems(p => p.filter(x => x !== item)); setConfirmDelete(null); }}
+                              style={{ ...S.btnSm, background: ready ? "#c0392b" : "#e6b3ac", color: "#fff", border: "none", cursor: ready ? "pointer" : "default" }}
+                            >
+                              Yes, remove
+                            </button>
+                          )}
+                        </DelayedConfirm>
+                        <button style={S.btnSm} onClick={() => setConfirmDelete(null)}>Cancel</button>
+                      </div>
+                    );
+                  }
+
+                  return (
+                    <EditableListItem key={item} value={item}
+                      onSave={next => renameInList(list.label, item, next)}
+                      onDelete={() => setConfirmDelete({ label: list.label, item, usage })} />
+                  );
+                })}
+                <div style={{ display: "flex", gap: "8px", marginTop: "10px" }}>
+                  <input value={list.draft} onChange={e => list.setDraft(e.target.value)}
+                    onKeyDown={e => e.key === "Enter" && addToList(list)}
+                    placeholder={`New ${list.label.slice(0, -1).toLowerCase()} name`} style={{ flex: 1 }} />
+                  <button style={S.btnSec} onClick={() => addToList(list)}>Add</button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+      </div>
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<App />);
+</script>
+
+<script>
+  if ("serviceWorker" in navigator) {
+    window.addEventListener("load", () => {
+      navigator.serviceWorker.register("service-worker.js").catch(() => {});
+    });
+  }
+</script>
+</body>
+</html>
