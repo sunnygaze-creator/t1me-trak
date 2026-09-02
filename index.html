@@ -1063,6 +1063,16 @@ root.render(<App />);
 </script>
 
 <script>
+  const appSrc = document.getElementById("app-source").textContent;
+  const { code } = Babel.transform(appSrc, {
+    presets: [["react", { runtime: "classic" }]],
+  });
+  const s = document.createElement("script");
+  s.text = code;
+  document.body.appendChild(s);
+</script>
+
+<script>
   if ("serviceWorker" in navigator) {
     window.addEventListener("load", () => {
       navigator.serviceWorker.register("service-worker.js").catch(() => {});
