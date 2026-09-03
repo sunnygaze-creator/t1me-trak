@@ -56,6 +56,11 @@ const toMins = t => {
   return h * 60 + m;
 };
 const minsToHHMM = mins => `${PAD(Math.floor(mins / 60))}:${PAD(mins % 60)}`;
+const addOneHour = t => {
+  if (!t) return "";
+  const mins = (toMins(t) + 60) % 1440;
+  return `${PAD(Math.floor(mins / 60))}:${PAD(mins % 60)}`;
+};
 const clockOf = d => `${PAD(d.getHours())}:${PAD(d.getMinutes())}`;
 
 const getMonday = dateStr => {
@@ -438,7 +443,7 @@ function App() {
   const [tab, setTab] = useState("track");
   const [sumView, setSumView] = useState("client");
 
-  const [form, setForm] = useState({ client: "", task: "", date: fmtDate(new Date()), in: "", out: "" });
+  const [form, setForm] = useState({ client: "", task: "", date: "", in: "", out: "" });
   const [formErr, setFormErr] = useState("");
   const setFormField = (key, val) => setForm(f => ({ ...f, [key]: val }));
 
@@ -498,6 +503,21 @@ function App() {
   }, [entries, clients, tasks, loaded]);
 
   const dirty = entries.length > 0 && (!lastExportAt || (lastModifiedAt && lastModifiedAt > lastExportAt));
+
+  // Default the manual-entry Date / Time In / Time Out to pick up right where
+  // the most recent log left off — only when the form is blank (freshly
+  // loaded or just reset after a submit), so it never overwrites an
+  // in-progress edit.
+  useEffect(() => {
+    if (!loaded) return;
+    if (form.date !== "" || form.in !== "" || form.out !== "") return;
+    const latest = entries[0];
+    if (latest) {
+      setForm(f => ({ ...f, date: latest.date, in: latest.timeOut, out: addOneHour(latest.timeOut) }));
+    } else {
+      setForm(f => ({ ...f, date: fmtDate(new Date()) }));
+    }
+  }, [entries, loaded]);
 
   useEffect(() => {
     if (!running) return;
@@ -560,7 +580,7 @@ function App() {
     }
     remember(client, task);
     addEntry({ client, task, date, timeIn: tIn, timeOut: tOut, duration: calcDuration(mins) });
-    setForm({ client: "", task: "", date: fmtDate(new Date()), in: "", out: "" });
+    setForm({ client: "", task: "", date: "", in: "", out: "" });
   }
 
   function updateEntry(id, field, value) {
