@@ -338,6 +338,11 @@ function download(filename, content, mime) {
 const BLACK = "#1a1a1a", DGRAY = "#4a4a4a", LTGRAY = "#e8e8e8", WHITE = "#fff";
 const DAY_LABELS = ["Su", "M", "T", "W", "T", "F", "Sa"];
 
+// Column widths (px), in order A..N: JobName, #, TypeOfWork, TimeIn, TimeOut,
+// Su, M, T, W, T, F, Sa, HRS/Job, Code/Amount.
+const COL_WIDTHS = [90, 28, 110, 65, 65, 34, 34, 34, 34, 34, 34, 34, 55, 80];
+const COLGROUP = `<colgroup>${COL_WIDTHS.map(w => `<col width="${w}" style="width:${w}px;mso-width-source:userset;">`).join("")}</colgroup>`;
+
 const esc = s => String(s ?? "").replace(/[&<>"]/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[ch]));
 
 const cell = (content = "", { bg = WHITE, fg = "", align = "left", bold = false, span = 1, extra = "" } = {}) =>
@@ -359,10 +364,12 @@ function buildTimecard(weekEntries, weekEnd, employee) {
     row([headCell("Weekly Time Card", 2), headCell("", 12)]),
     row([
       headCell("Employees Name:"), headCell(""),
-      headCell(esc(employee), 2), headCell("", 3),
-      headCell("Week Ending:", 1, "center"),
+      headCell(esc(employee), 2),
+      headCell("", 1),
+      headCell("Week Ending:", 3, "center"),
       headCell(weekEnd, 3, "center"),
-      headCell("Date", 2, "center"),
+      headCell("", 2),
+      headCell("Date", 1, "center"),
     ]),
     row([
       colCell("Job Name"), colCell("#", "center"), colCell("Type of Work"),
@@ -411,7 +418,7 @@ function buildTimecard(weekEntries, weekEnd, employee) {
     `<head><meta charset="UTF-8"><!--[if gte mso 9]><xml><x:ExcelWorkbook><x:ExcelWorksheets>` +
     `<x:ExcelWorksheet><x:Name>Time Card</x:Name></x:ExcelWorksheet></x:ExcelWorksheets>` +
     `</x:ExcelWorkbook></xml><![endif]--></head><body>` +
-    `<table style="border-collapse:collapse;font-family:Arial,sans-serif;width:100%;">${rows.join("")}</table>` +
+    `<table style="border-collapse:collapse;font-family:Arial,sans-serif;width:100%;">${COLGROUP}${rows.join("")}</table>` +
     `</body></html>`;
 }
 
