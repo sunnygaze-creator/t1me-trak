@@ -441,7 +441,7 @@ function App() {
   const [loaded, setLoaded] = useState(false);
 
   const [tab, setTab] = useState("track");
-  const [sumView, setSumView] = useState("client");
+  const [sumView, setSumView] = useState("day");
 
   const [form, setForm] = useState({ client: "", task: "", date: "", in: "", out: "" });
   const [formErr, setFormErr] = useState("");
@@ -1032,7 +1032,7 @@ function App() {
             </div>
 
             <div style={{ display: "flex", gap: "4px", marginBottom: "1.25rem", background: PAPER, padding: "4px", borderRadius: "4px", width: "fit-content" }}>
-              {["client", "task", "week", "day"].map(v => (
+              {["day", "week", "client", "task"].map(v => (
                 <button key={v} style={sumView === v ? S.segOn : S.segOff} onClick={() => setSumView(v)}>{cap(v)}</button>
               ))}
             </div>
