@@ -342,7 +342,9 @@ function download(filename, content, mime) {
 
 const BLACK = "#1a1a1a", DGRAY = "#4a4a4a", LGRAY_HDR = "#c7c7c7", LTGRAY = "#e8e8e8", WHITE = "#fff";
 const DAY_LABELS = ["Su", "M", "T", "W", "T", "F", "Sa"];
+const THIN = "1.5px solid #000";
 const THICK = "2.5px solid #000";
+const NONE = "none";
 
 // Column widths (px), in order A..N: JobName, #, TypeOfWork, TimeIn, TimeOut,
 // Su, M, T, W, T, F, Sa, HRS/Job, Code/Amount.
@@ -351,13 +353,16 @@ const COLGROUP = `<colgroup>${COL_WIDTHS.map(w => `<col width="${w}" style="widt
 
 const esc = s => String(s ?? "").replace(/[&<>"]/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[ch]));
 
-const cell = (content = "", { bg = WHITE, fg = "", align = "left", bold = false, span = 1, rowspan = 1, border = "1.5px solid #000", extra = "" } = {}) =>
-  `<td colspan="${span}"${rowspan > 1 ? ` rowspan="${rowspan}"` : ""} style="border:${border};font-size:11px;padding:5px 6px;` +
+// Every border side is set explicitly (never a shorthand `border:` mixed with
+// a longhand override) — some HTML-to-spreadsheet importers (Google Sheets)
+// don't resolve that combination correctly and silently drop the override.
+const cell = (content = "", { bg = WHITE, fg = "", align = "left", bold = false, span = 1, rowspan = 1, top = THIN, right = THIN, bottom = THIN, left = THIN, extra = "" } = {}) =>
+  `<td colspan="${span}"${rowspan > 1 ? ` rowspan="${rowspan}"` : ""} style="border-top:${top};border-right:${right};border-bottom:${bottom};border-left:${left};font-size:11px;padding:5px 6px;` +
   `background:${bg};text-align:${align};${bold ? "font-weight:bold;" : ""}${fg ? `color:${fg};` : ""}${extra}">${content}</td>`;
 
 const row = cells => `<tr>${cells.join("")}</tr>`;
-const headCell = (text, span = 1, align = "left", extra = "") => cell(text, { bg: BLACK, fg: "#fff", bold: true, span, align, extra });
-const colCell = (text, align = "left", extra = "") => cell(text, { bg: DGRAY, fg: "#fff", bold: true, align, extra });
+const headCell = (text, span = 1, align = "left", sides = {}) => cell(text, { bg: BLACK, fg: "#fff", bold: true, span, align, ...sides });
+const colCell = (text, align = "left", sides = {}) => cell(text, { bg: DGRAY, fg: "#fff", bold: true, align, ...sides });
 
 function buildTimecard(weekEntries, weekEnd, employee) {
   const REG_CAP = 480; // 8 hours, in minutes
@@ -372,26 +377,26 @@ function buildTimecard(weekEntries, weekEnd, employee) {
 
   const rows = [
     row([
-      headCell("Weekly Time Card", 2, "left", `border-top:${THICK};border-left:${THICK};`),
-      headCell("", 12, "left", `border-top:${THICK};border-right:${THICK};`),
+      headCell("Weekly Time Card", 2, "left", { top: THICK, left: THICK }),
+      headCell("", 12, "left", { top: THICK, right: THICK }),
     ]),
     row([
-      headCell("Employees Name:", 1, "left", `border-left:${THICK};`), headCell(""),
+      headCell("Employees Name:", 1, "left", { left: THICK }), headCell(""),
       headCell(esc(employee), 2),
       headCell("", 1),
       headCell("Week Ending:", 3, "center"),
       headCell(weekEnd, 3, "center"),
-      headCell("", 3, "left", `border-right:${THICK};`),
+      headCell("", 3, "left", { right: THICK }),
     ]),
     row([
-      colCell("Job Name", "left", `border-bottom:${THICK};border-left:${THICK};`),
-      colCell("#", "center", `border-bottom:${THICK};`),
-      colCell("Type of Work", "left", `border-bottom:${THICK};`),
-      colCell("Time In", "center", `border-bottom:${THICK};`),
-      colCell("Time Out", "center", `border-bottom:${THICK};`),
-      ...DAY_LABELS.map(d => colCell(d, "center", `border-bottom:${THICK};`)),
-      colCell("HRS/Job", "center", `border-bottom:${THICK};`),
-      cell("Code/Amount", { bg: LGRAY_HDR, bold: true, align: "center", extra: `border-bottom:${THICK};border-right:${THICK};` }),
+      colCell("Job Name", "left", { bottom: THICK, left: THICK }),
+      colCell("#", "center", { bottom: THICK }),
+      colCell("Type of Work", "left", { bottom: THICK }),
+      colCell("Time In", "center", { bottom: THICK }),
+      colCell("Time Out", "center", { bottom: THICK }),
+      ...DAY_LABELS.map(d => colCell(d, "center", { bottom: THICK })),
+      colCell("HRS/Job", "center", { bottom: THICK }),
+      cell("Code/Amount", { bg: LGRAY_HDR, bold: true, align: "center", bottom: THICK, right: THICK }),
     ]),
   ];
 
@@ -401,20 +406,17 @@ function buildTimecard(weekEntries, weekEnd, employee) {
     const day = e ? dayOfWeek(e.date) : -1;
     const value = e ? hrs(e.duration) : "";
     const isFirst = i === 0, isLast = i === rowCount - 1;
-    const leftEdge = `border-left:${THICK};`;
-    const rightEdge = `border-right:${THICK};`;
-    const topEdge = isFirst ? `border-top:${THICK};` : "";
-    const bottomEdge = isLast ? `border-bottom:${THICK};` : "";
+    const dTop = isFirst ? THICK : THIN, dBottom = isLast ? THICK : THIN;
 
     rows.push(row([
-      cell(e ? esc(e.client) : "", { bg, extra: leftEdge }),
+      cell(e ? esc(e.client) : "", { bg, left: THICK }),
       cell(i + 1, { bg, align: "center" }),
       cell(e ? esc(e.task) : "", { bg }),
-      cell(e ? fmt12(e.timeIn) : "", { bg, align: "center", extra: leftEdge + topEdge + bottomEdge }),
-      cell(e ? fmt12(e.timeOut) : "", { bg, align: "center", extra: rightEdge + topEdge + bottomEdge }),
+      cell(e ? fmt12(e.timeIn) : "", { bg, align: "center", left: THICK, top: dTop, bottom: dBottom }),
+      cell(e ? fmt12(e.timeOut) : "", { bg, align: "center", right: THICK, top: dTop, bottom: dBottom }),
       ...DAY_LABELS.map((_, d) => cell(day === d ? value : "", { bg, align: "center" })),
       cell(value, { bg, align: "center" }),
-      cell("", { bg, extra: rightEdge }),
+      cell("", { bg, right: THICK }),
     ]));
   }
 
@@ -422,28 +424,30 @@ function buildTimecard(weekEntries, weekEnd, employee) {
   // info and the blank Code/Amount cell each span both rows.
   rows.push(row([
     cell("Aum Construction, Inc.<br>Post Office Box 1033<br>Mendocino, CA 95460",
-      { span: 2, rowspan: 2, extra: `font-size:10px;vertical-align:middle;border-top:${THICK};border-left:${THICK};` }),
-    cell("Total Regular Time:", { span: 3, bold: true, extra: `border-top:${THICK};border-right:${THICK};` }),
-    ...dayRegular.map(m => cell(m > 0 ? hrs(m) : "", { bg: DGRAY, fg: "#fff", bold: true, align: "center", extra: `border-top:${THICK};` })),
-    cell(hrs(totalRegular), { bg: DGRAY, fg: "#fff", bold: true, align: "center", extra: `border-top:${THICK};border-right:${THICK};` }),
-    cell("", { bg: LGRAY_HDR, rowspan: 2, extra: `border-top:${THICK};border-right:${THICK};` }),
+      { span: 2, rowspan: 2, top: THICK, left: THICK, extra: "font-size:10px;vertical-align:middle;" }),
+    cell("Total Regular Time:", { span: 3, bold: true, top: THICK, right: THICK }),
+    cell(dayRegular[0] > 0 ? hrs(dayRegular[0]) : "", { bg: DGRAY, fg: "#fff", bold: true, align: "center", top: THICK, left: THICK }),
+    ...dayRegular.slice(1).map(m => cell(m > 0 ? hrs(m) : "", { bg: DGRAY, fg: "#fff", bold: true, align: "center", top: THICK })),
+    cell(hrs(totalRegular), { bg: DGRAY, fg: "#fff", bold: true, align: "center", top: THICK, right: THICK }),
+    cell("", { bg: LGRAY_HDR, rowspan: 2, top: THICK, right: THICK }),
   ]));
 
   rows.push(row([
-    cell("Total Overtime:", { span: 3, bold: true, extra: `border-bottom:${THICK};border-right:${THICK};` }),
-    ...dayOvertime.map(m => cell(m > 0 ? hrs(m) : "", { bg: DGRAY, fg: "#fff", bold: true, align: "center", extra: `border-bottom:${THICK};` })),
-    cell(hrs(totalOvertime), { bg: DGRAY, fg: "#fff", bold: true, align: "center", extra: `border-bottom:${THICK};border-right:${THICK};` }),
+    cell("Total Overtime:", { span: 3, bold: true, bottom: THICK, right: THICK }),
+    cell(dayOvertime[0] > 0 ? hrs(dayOvertime[0]) : "", { bg: DGRAY, fg: "#fff", bold: true, align: "center", bottom: THICK, left: THICK }),
+    ...dayOvertime.slice(1).map(m => cell(m > 0 ? hrs(m) : "", { bg: DGRAY, fg: "#fff", bold: true, align: "center", bottom: THICK })),
+    cell(hrs(totalOvertime), { bg: DGRAY, fg: "#fff", bold: true, align: "center", bottom: THICK, right: THICK }),
   ]));
 
   // Blank unbordered spacer row.
-  rows.push(row([cell("", { span: 14, border: "none" })]));
+  rows.push(row([cell("", { span: 14, top: NONE, right: NONE, bottom: NONE, left: NONE })]));
 
   // Simplified signature line — no boxes, just underlines to write on.
   rows.push(row([
-    cell("Signature:", { border: "none", bold: true }),
-    cell("", { border: "none", span: 5, extra: "border-bottom:1.5px solid #000;" }),
-    cell("Date:", { border: "none", bold: true, align: "center" }),
-    cell("", { border: "none", span: 7, extra: "border-bottom:1.5px solid #000;" }),
+    cell("Signature:", { top: NONE, right: NONE, bottom: NONE, left: NONE, bold: true }),
+    cell("", { top: NONE, right: NONE, left: NONE, bottom: THIN, span: 5 }),
+    cell("Date:", { top: NONE, right: NONE, bottom: NONE, left: NONE, bold: true, align: "center" }),
+    cell("", { top: NONE, right: NONE, left: NONE, bottom: THIN, span: 7 }),
   ]));
 
   return `<html xmlns:o="urn:schemas-microsoft-com:office:office" ` +
