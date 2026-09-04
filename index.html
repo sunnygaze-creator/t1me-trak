@@ -457,6 +457,7 @@ function App() {
   const [newTask, setNewTask] = useState("");
   const [tcWeek, setTcWeek] = useState(() => getMonday(fmtDate(new Date())));
   const [logWeek, setLogWeek] = useState(() => getMonday(fmtDate(new Date())));
+  const [sumWeek, setSumWeek] = useState(() => getMonday(fmtDate(new Date())));
   const [purgeBefore, setPurgeBefore] = useState("");
   const [confirmPurge, setConfirmPurge] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(null); // { label, item, usage } | null
@@ -601,6 +602,14 @@ function App() {
 
   function shiftWeek(delta) {
     setLogWeek(prev => {
+      const d = localDate(prev);
+      d.setDate(d.getDate() + 7 * delta);
+      return fmtDate(d);
+    });
+  }
+
+  function shiftSumWeek(delta) {
+    setSumWeek(prev => {
       const d = localDate(prev);
       d.setDate(d.getDate() + 7 * delta);
       return fmtDate(d);
@@ -767,6 +776,37 @@ function App() {
           <tr style={{ borderTop: `1.5px solid ${INK}`, background: "#e8e8e8" }}>
             <td style={S.tdTotal}>Total</td>
             <td style={S.tdTotal}>{minsToHHMM(total)}</td>
+          </tr>
+        </tfoot>
+      </table>
+    );
+  }
+
+  function DaySummaryTable({ weekStart, entries }) {
+    const days = [];
+    for (let i = 0; i < 7; i++) {
+      const d = localDate(weekStart);
+      d.setDate(d.getDate() + i);
+      days.push(fmtDate(d));
+    }
+    const totals = days.map(ds => entries.filter(e => e.date === ds).reduce((s, e) => s + e.duration, 0));
+    const weekTotal = totals.reduce((s, v) => s + v, 0);
+    return (
+      <table style={S.table}>
+        <thead><tr><th style={S.th}>Day</th><th style={S.th}>Date</th><th style={S.th}>Duration</th></tr></thead>
+        <tbody>
+          {days.map((ds, i) => (
+            <tr key={ds}>
+              <td style={S.td}>{localDate(ds).toLocaleString("default", { weekday: "short" })}</td>
+              <td style={S.td}>{ds}</td>
+              <td style={S.td}>{minsToHHMM(totals[i])}</td>
+            </tr>
+          ))}
+        </tbody>
+        <tfoot>
+          <tr style={{ borderTop: `1.5px solid ${INK}`, background: "#e8e8e8" }}>
+            <td style={S.tdTotal} colSpan={2}>Total</td>
+            <td style={S.tdTotal}>{minsToHHMM(weekTotal)}</td>
           </tr>
         </tfoot>
       </table>
@@ -992,12 +1032,29 @@ function App() {
             </div>
 
             <div style={{ display: "flex", gap: "4px", marginBottom: "1.25rem", background: PAPER, padding: "4px", borderRadius: "4px", width: "fit-content" }}>
-              {["client", "task", "week"].map(v => (
+              {["client", "task", "week", "day"].map(v => (
                 <button key={v} style={sumView === v ? S.segOn : S.segOff} onClick={() => setSumView(v)}>{cap(v)}</button>
               ))}
             </div>
 
-            <SummaryTable data={summaries[sumView]} keyLabel={sumView} />
+            {sumView === "day" ? (
+              <div>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "12px", flexWrap: "wrap", gap: "8px" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                    <button style={S.btnSm} onClick={() => shiftSumWeek(-1)}>‹ Prev</button>
+                    <span style={{ fontSize: "13px", fontWeight: 600, color: INK }}>{weekLabel(sumWeek)}</span>
+                    <button style={S.btnSm} onClick={() => shiftSumWeek(1)}>Next ›</button>
+                    {sumWeek !== getMonday(fmtDate(new Date())) && (
+                      <button style={S.btnSm} onClick={() => setSumWeek(getMonday(fmtDate(new Date())))}>This week</button>
+                    )}
+                  </div>
+                  <input type="date" value={sumWeek} onChange={e => setSumWeek(getMonday(e.target.value))} style={{ fontSize: "12px" }} />
+                </div>
+                <DaySummaryTable weekStart={sumWeek} entries={entries} />
+              </div>
+            ) : (
+              <SummaryTable data={summaries[sumView]} keyLabel={sumView} />
+            )}
 
             <div style={{ marginTop: "1.5rem", borderTop: `0.5px solid ${RULE}`, paddingTop: "1.25rem" }}>
               <p style={{ fontSize: "14px", fontWeight: 600, color: INK, marginBottom: "10px" }}>Export timecard</p>
