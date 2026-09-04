@@ -340,8 +340,9 @@ function download(filename, content, mime) {
 
 /* ── Timecard builder ─────────────────────────────────────────────── */
 
-const BLACK = "#1a1a1a", DGRAY = "#4a4a4a", LTGRAY = "#e8e8e8", WHITE = "#fff";
+const BLACK = "#1a1a1a", DGRAY = "#4a4a4a", LGRAY_HDR = "#c7c7c7", LTGRAY = "#e8e8e8", WHITE = "#fff";
 const DAY_LABELS = ["Su", "M", "T", "W", "T", "F", "Sa"];
+const THICK = "2.5px solid #000";
 
 // Column widths (px), in order A..N: JobName, #, TypeOfWork, TimeIn, TimeOut,
 // Su, M, T, W, T, F, Sa, HRS/Job, Code/Amount.
@@ -350,37 +351,47 @@ const COLGROUP = `<colgroup>${COL_WIDTHS.map(w => `<col width="${w}" style="widt
 
 const esc = s => String(s ?? "").replace(/[&<>"]/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[ch]));
 
-const cell = (content = "", { bg = WHITE, fg = "", align = "left", bold = false, span = 1, extra = "" } = {}) =>
-  `<td colspan="${span}" style="border:1.5px solid #000;font-size:11px;padding:5px 6px;` +
+const cell = (content = "", { bg = WHITE, fg = "", align = "left", bold = false, span = 1, rowspan = 1, border = "1.5px solid #000", extra = "" } = {}) =>
+  `<td colspan="${span}"${rowspan > 1 ? ` rowspan="${rowspan}"` : ""} style="border:${border};font-size:11px;padding:5px 6px;` +
   `background:${bg};text-align:${align};${bold ? "font-weight:bold;" : ""}${fg ? `color:${fg};` : ""}${extra}">${content}</td>`;
 
 const row = cells => `<tr>${cells.join("")}</tr>`;
-const headCell = (text, span = 1, align = "left") => cell(text, { bg: BLACK, fg: "#fff", bold: true, span, align });
-const colCell = (text, align = "left") => cell(text, { bg: DGRAY, fg: "#fff", bold: true, align });
+const headCell = (text, span = 1, align = "left", extra = "") => cell(text, { bg: BLACK, fg: "#fff", bold: true, span, align, extra });
+const colCell = (text, align = "left", extra = "") => cell(text, { bg: DGRAY, fg: "#fff", bold: true, align, extra });
 
 function buildTimecard(weekEntries, weekEnd, employee) {
+  const REG_CAP = 480; // 8 hours, in minutes
   const dayTotals = [0, 0, 0, 0, 0, 0, 0];
   weekEntries.forEach(e => { dayTotals[dayOfWeek(e.date)] += e.duration; });
-  const weekTotal = dayTotals.reduce((s, v) => s + v, 0);
+  const dayRegular = dayTotals.map(m => Math.min(m, REG_CAP));
+  const dayOvertime = dayTotals.map(m => Math.max(0, m - REG_CAP));
+  const totalRegular = dayRegular.reduce((s, v) => s + v, 0);
+  const totalOvertime = dayOvertime.reduce((s, v) => s + v, 0);
   const hrs = mins => (mins / 60).toFixed(4);
   const rowCount = Math.max(20, weekEntries.length);
 
   const rows = [
-    row([headCell("Weekly Time Card", 2), headCell("", 12)]),
     row([
-      headCell("Employees Name:"), headCell(""),
+      headCell("Weekly Time Card", 2, "left", `border-top:${THICK};border-left:${THICK};`),
+      headCell("", 12, "left", `border-top:${THICK};border-right:${THICK};`),
+    ]),
+    row([
+      headCell("Employees Name:", 1, "left", `border-left:${THICK};`), headCell(""),
       headCell(esc(employee), 2),
       headCell("", 1),
       headCell("Week Ending:", 3, "center"),
       headCell(weekEnd, 3, "center"),
-      headCell("", 2),
-      headCell("Date", 1, "center"),
+      headCell("", 3, "left", `border-right:${THICK};`),
     ]),
     row([
-      colCell("Job Name"), colCell("#", "center"), colCell("Type of Work"),
-      colCell("Time In", "center"), colCell("Time Out", "center"),
-      ...DAY_LABELS.map(d => colCell(d, "center")),
-      colCell("HRS/Job", "center"), colCell("Code/Amount", "center"),
+      colCell("Job Name", "left", `border-bottom:${THICK};border-left:${THICK};`),
+      colCell("#", "center", `border-bottom:${THICK};`),
+      colCell("Type of Work", "left", `border-bottom:${THICK};`),
+      colCell("Time In", "center", `border-bottom:${THICK};`),
+      colCell("Time Out", "center", `border-bottom:${THICK};`),
+      ...DAY_LABELS.map(d => colCell(d, "center", `border-bottom:${THICK};`)),
+      colCell("HRS/Job", "center", `border-bottom:${THICK};`),
+      cell("Code/Amount", { bg: LGRAY_HDR, bold: true, align: "center", extra: `border-bottom:${THICK};border-right:${THICK};` }),
     ]),
   ];
 
@@ -389,33 +400,50 @@ function buildTimecard(weekEntries, weekEnd, employee) {
     const bg = i % 2 === 0 ? WHITE : LTGRAY;
     const day = e ? dayOfWeek(e.date) : -1;
     const value = e ? hrs(e.duration) : "";
+    const isFirst = i === 0, isLast = i === rowCount - 1;
+    const leftEdge = `border-left:${THICK};`;
+    const rightEdge = `border-right:${THICK};`;
+    const topEdge = isFirst ? `border-top:${THICK};` : "";
+    const bottomEdge = isLast ? `border-bottom:${THICK};` : "";
+
     rows.push(row([
-      cell(e ? esc(e.client) : "", { bg }),
+      cell(e ? esc(e.client) : "", { bg, extra: leftEdge }),
       cell(i + 1, { bg, align: "center" }),
       cell(e ? esc(e.task) : "", { bg }),
-      cell(e ? fmt12(e.timeIn) : "", { bg, align: "center" }),
-      cell(e ? fmt12(e.timeOut) : "", { bg, align: "center" }),
+      cell(e ? fmt12(e.timeIn) : "", { bg, align: "center", extra: leftEdge + topEdge + bottomEdge }),
+      cell(e ? fmt12(e.timeOut) : "", { bg, align: "center", extra: rightEdge + topEdge + bottomEdge }),
       ...DAY_LABELS.map((_, d) => cell(day === d ? value : "", { bg, align: "center" })),
       cell(value, { bg, align: "center" }),
-      cell("", { bg }),
+      cell("", { bg, extra: rightEdge }),
     ]));
   }
 
+  // Totals: Regular time (capped at 8h/day) on top, Overtime below — company
+  // info and the blank Code/Amount cell each span both rows.
   rows.push(row([
     cell("Aum Construction, Inc.<br>Post Office Box 1033<br>Mendocino, CA 95460",
-      { span: 3, extra: "font-size:10px;vertical-align:top;" }),
-    cell("", { bg: BLACK, span: 2 }),
-    ...dayTotals.map(m => cell(m > 0 ? hrs(m) : "", { bg: BLACK, fg: "#fff", bold: true, align: "center" })),
-    cell(hrs(weekTotal), { bg: BLACK, fg: "#fff", bold: true, align: "center" }),
-    cell("", { bg: BLACK }),
+      { span: 2, rowspan: 2, extra: `font-size:10px;vertical-align:middle;border-top:${THICK};border-left:${THICK};` }),
+    cell("Total Regular Time:", { span: 3, bold: true, extra: `border-top:${THICK};border-right:${THICK};` }),
+    ...dayRegular.map(m => cell(m > 0 ? hrs(m) : "", { bg: DGRAY, fg: "#fff", bold: true, align: "center", extra: `border-top:${THICK};` })),
+    cell(hrs(totalRegular), { bg: DGRAY, fg: "#fff", bold: true, align: "center", extra: `border-top:${THICK};border-right:${THICK};` }),
+    cell("", { bg: LGRAY_HDR, rowspan: 2, extra: `border-top:${THICK};border-right:${THICK};` }),
   ]));
 
-  rows.push(row([cell("Total Overtime", { span: 2 }), cell("", { span: 12 })]));
-
-  const sigLine = "border-bottom:2px solid #000;";
   rows.push(row([
-    cell("Signature:"), cell("", { span: 5, extra: sigLine }),
-    cell("Date:"), cell("", { span: 6, extra: sigLine }),
+    cell("Total Overtime:", { span: 3, bold: true, extra: `border-bottom:${THICK};border-right:${THICK};` }),
+    ...dayOvertime.map(m => cell(m > 0 ? hrs(m) : "", { bg: DGRAY, fg: "#fff", bold: true, align: "center", extra: `border-bottom:${THICK};` })),
+    cell(hrs(totalOvertime), { bg: DGRAY, fg: "#fff", bold: true, align: "center", extra: `border-bottom:${THICK};border-right:${THICK};` }),
+  ]));
+
+  // Blank unbordered spacer row.
+  rows.push(row([cell("", { span: 14, border: "none" })]));
+
+  // Simplified signature line — no boxes, just underlines to write on.
+  rows.push(row([
+    cell("Signature:", { border: "none", bold: true }),
+    cell("", { border: "none", span: 5, extra: "border-bottom:1.5px solid #000;" }),
+    cell("Date:", { border: "none", bold: true, align: "center" }),
+    cell("", { border: "none", span: 7, extra: "border-bottom:1.5px solid #000;" }),
   ]));
 
   return `<html xmlns:o="urn:schemas-microsoft-com:office:office" ` +
