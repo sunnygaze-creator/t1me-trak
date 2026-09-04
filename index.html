@@ -13,18 +13,15 @@
   :root {
     --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     --color-background-primary: #ffffff;
-    --color-background-secondary: #f5f4f2;
     --color-text-primary: #1a1a1a;
     --color-text-secondary: #6b6b6b;
     --color-text-tertiary: #9a9a9a;
     --color-text-danger: #c0392b;
-    --color-background-danger: #fdecea;
     --color-border-secondary: #cccccc;
-    --color-border-tertiary: #dddddd;
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; background: #e9e8e5; font-family: var(--font-sans); }
-  #root { max-width: 720px; margin: 0 auto; min-height: 100vh; }
+  #root { max-width: 760px; margin: 0 auto; min-height: 100vh; }
   button, input, select { font-family: inherit; }
 </style>
 </head>
@@ -37,12 +34,14 @@
 <script crossorigin src="https://unpkg.com/papaparse@5.4.1/papaparse.min.js"></script>
 
 <script type="text/plain" id="app-source">
-const { useState, useEffect, useRef, useCallback } = React;
+const { useState, useEffect, useRef, useMemo, useCallback } = React;
 
 /* ── Time & date helpers ──────────────────────────────────────────── */
 
 const PAD = n => String(n).padStart(2, "0");
 const fmtDate = d => `${d.getFullYear()}-${PAD(d.getMonth() + 1)}-${PAD(d.getDate())}`;
+
+// Parse YYYY-MM-DD at local noon so DST and UTC offsets can't shift the day.
 const localDate = dateStr => new Date(`${dateStr}T12:00:00`);
 
 const fmt12 = t => {
@@ -55,13 +54,21 @@ const toMins = t => {
   const [h, m] = t.split(":").map(Number);
   return h * 60 + m;
 };
-const minsToHHMM = mins => `${PAD(Math.floor(mins / 60))}:${PAD(mins % 60)}`;
-const addOneHour = t => {
-  if (!t) return "";
-  const mins = (toMins(t) + 60) % 1440;
-  return `${PAD(Math.floor(mins / 60))}:${PAD(mins % 60)}`;
-};
+const minsToClock = mins => `${PAD(Math.floor(mins / 60))}:${PAD(mins % 60)}`;
+const addOneHour = t => (t ? minsToClock((toMins(t) + 60) % 1440) : "");
 const clockOf = d => `${PAD(d.getHours())}:${PAD(d.getMinutes())}`;
+
+// Times are bare clock values, so an "out" earlier than the "in" is read as
+// crossing midnight. Equal times are the one genuinely invalid case — they're
+// ambiguous between a zero-length entry and a full 24 hours.
+const spanMins = (timeIn, timeOut) => {
+  const a = toMins(timeIn), b = toMins(timeOut);
+  if (b > a) return b - a;
+  if (b < a) return 1440 - a + b;
+  return 0;
+};
+const isOvernight = e => toMins(e.timeOut) < toMins(e.timeIn);
+const isValidSpan = e => spanMins(e.timeIn, e.timeOut) > 0;
 
 const getMonday = dateStr => {
   const d = localDate(dateStr);
@@ -73,6 +80,11 @@ const getSunday = mon => {
   d.setDate(d.getDate() + 6);
   return fmtDate(d);
 };
+const shiftDays = (dateStr, days) => {
+  const d = localDate(dateStr);
+  d.setDate(d.getDate() + days);
+  return fmtDate(d);
+};
 const weekLabel = mon => {
   const short = s => {
     const d = localDate(s);
@@ -81,6 +93,8 @@ const weekLabel = mon => {
   return `${short(mon)} – ${short(getSunday(mon))}`;
 };
 const dayOfWeek = dateStr => localDate(dateStr).getDay();
+const today = () => fmtDate(new Date());
+const thisMonday = () => getMonday(today());
 
 const timeAgo = ms => {
   if (!ms) return null;
@@ -92,6 +106,9 @@ const timeAgo = ms => {
   return `${Math.floor(hrs / 24)}d ago`;
 };
 
+let idSeq = 0;
+const makeId = () => `${Date.now().toString(36)}-${(idSeq++).toString(36)}`;
+
 const entryKey = e => `${e.date}|${e.client}|${e.task}|${e.timeIn}|${e.timeOut}`;
 
 const parseAmPmTime = s => {
@@ -102,24 +119,28 @@ const parseAmPmTime = s => {
   return `${PAD(h)}:${m[2]}`;
 };
 
+/* ── CSV parsing ──────────────────────────────────────────────────── */
+
 function parseEntriesCSV(text) {
   const lines = text.split(/\r?\n/);
-  const headerIdx = lines.findIndex(l => l.replace(/"/g, "").trim().startsWith("Date,Client,Task"));
-  if (headerIdx === -1) throw new Error("Couldn't find an entries table in this file.");
-  let endIdx = lines.length;
-  for (let i = headerIdx + 1; i < lines.length; i++) {
-    if (lines[i].trim() === "") { endIdx = i; break; }
+  const start = lines.findIndex(l => l.replace(/"/g, "").trim().startsWith("Date,Client,Task"));
+  if (start === -1) throw new Error("Couldn't find an entries table in this file.");
+  let end = lines.length;
+  for (let i = start + 1; i < lines.length; i++) {
+    if (lines[i].trim() === "") { end = i; break; }
   }
-  const chunk = lines.slice(headerIdx, endIdx).join("\n");
-  const { data } = Papa.parse(chunk, { header: true, skipEmptyLines: true });
+  const { data } = Papa.parse(lines.slice(start, end).join("\n"), {
+    header: true,
+    skipEmptyLines: true,
+  });
   return data;
 }
 
 function parseListSection(text, title) {
   const lines = text.split(/\r?\n/);
-  const headerIdx = lines.findIndex(l => l.replace(/"/g, "").trim() === `--- ${title} ---`);
-  if (headerIdx === -1) return [];
-  const start = headerIdx + 2;
+  const header = lines.findIndex(l => l.replace(/"/g, "").trim() === `--- ${title} ---`);
+  if (header === -1) return [];
+  const start = header + 2;
   let end = lines.length;
   for (let i = start; i < lines.length; i++) {
     if (lines[i].trim() === "") { end = i; break; }
@@ -129,7 +150,7 @@ function parseListSection(text, title) {
     .filter(Boolean);
 }
 
-/* ── Persistence (localStorage — standalone equivalent of window.storage) ── */
+/* ── Persistence (localStorage — no server involved) ──────────────── */
 
 const KEYS = {
   entries: "tt_entries_v4",
@@ -141,7 +162,7 @@ const KEYS = {
 };
 
 const store = {
-  async get(key, fallback) {
+  get(key, fallback) {
     try {
       const raw = localStorage.getItem(key);
       return raw !== null ? JSON.parse(raw) : fallback;
@@ -169,6 +190,12 @@ function usePersist(key, value, enabled) {
 const INK = "#1a1a1a";
 const PAPER = "#f0efec";
 const RULE = "#ddd";
+const DANGER = "#c0392b";
+const DANGER_DIM = "#e6b3ac";
+const WARN_BG = "#fdf3e3";
+const WARN_FG = "#8a5a00";
+const OK_BG = "#eaf6ec";
+const OK_FG = "#2e7d43";
 
 const S = {
   btnSm: { padding: "4px 10px", borderRadius: "4px", fontSize: "12px", cursor: "pointer", border: "0.5px solid #bbb", background: "transparent", color: "var(--color-text-primary)" },
@@ -185,7 +212,10 @@ const S = {
   grid3: { display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "12px", marginBottom: "12px" },
   fill: { width: "100%", boxSizing: "border-box" },
   muted: { fontSize: "13px", color: "var(--color-text-tertiary)" },
+  note: { fontSize: "13px", color: "var(--color-text-secondary)" },
   sectionHead: { fontSize: "15px", fontWeight: 600, color: INK, marginBottom: "10px" },
+  sectionBlock: { marginTop: "1.5rem", borderTop: `0.5px solid ${RULE}`, paddingTop: "1.25rem" },
+  sectionTitle: { fontSize: "14px", fontWeight: 600, color: INK, marginBottom: "4px" },
   statCard: { background: PAPER, borderRadius: "6px", padding: "0.75rem 1rem" },
   statLabel: { fontSize: "12px", color: "#555", marginBottom: "4px" },
   statValue: { fontSize: "22px", fontWeight: 600, color: INK },
@@ -195,6 +225,9 @@ const S = {
   tabOff: { padding: "10px 16px", fontSize: "13px", fontWeight: 400, color: "#aaa", background: "transparent", border: "none", borderBottom: "2px solid transparent", cursor: "pointer" },
   segOn: { padding: "5px 14px", fontSize: "13px", fontWeight: 500, borderRadius: "4px", border: "0.5px solid #bbb", background: INK, color: "#fff", cursor: "pointer" },
   segOff: { padding: "5px 14px", fontSize: "13px", fontWeight: 400, borderRadius: "4px", border: "0.5px solid transparent", background: "transparent", color: "var(--color-text-secondary)", cursor: "pointer" },
+  rowFlex: { display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" },
+  weekNav: { display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "12px", flexWrap: "wrap", gap: "8px" },
+  warnBox: { background: WARN_BG, border: "0.5px solid #e0c894", borderRadius: "4px", padding: "10px 12px" },
 };
 
 /* ── Reusable inputs ──────────────────────────────────────────────── */
@@ -210,15 +243,25 @@ function TimePicker({ value, onChange, increment }) {
     onChange(`${PAD(hh)}:${PAD(Number(minute))}`);
   };
 
-  const minutes = [];
-  for (let m = 0; m < 60; m += increment) minutes.push(m);
+  // Always include the current minute even if it's off the active increment,
+  // otherwise the select has no matching option and renders blank.
+  const minutes = useMemo(() => {
+    const out = [];
+    for (let m = 0; m < 60; m += increment) out.push(m);
+    if (min != null && !out.includes(min)) {
+      out.push(min);
+      out.sort((a, b) => a - b);
+    }
+    return out;
+  }, [increment, min]);
+
   const sel = { fontSize: "14px", padding: "4px", boxSizing: "border-box" };
 
   return (
     <div style={{ display: "flex", gap: "4px", alignItems: "center" }}>
       <select value={h12} onChange={e => emit(e.target.value, min ?? 0, ampm)} style={{ ...sel, width: "60px" }}>
         <option value="">--</option>
-        {[1,2,3,4,5,6,7,8,9,10,11,12].map(h => <option key={h} value={h}>{h}</option>)}
+        {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12].map(h => <option key={h} value={h}>{h}</option>)}
       </select>
       <span style={{ fontSize: "14px", color: "var(--color-text-secondary)" }}>:</span>
       <select value={min ?? ""} onChange={e => emit(h12, e.target.value, ampm)} style={{ ...sel, width: "60px" }}>
@@ -283,17 +326,13 @@ function EditableListItem({ value, onSave, onDelete }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(value);
   const ref = useRef();
-  const busy = useRef(false);
 
   useEffect(() => { if (editing) ref.current?.focus(); }, [editing]);
 
   const commit = () => {
-    if (busy.current) return;
-    busy.current = true;
     setEditing(false);
     const next = draft.trim();
     if (next && next !== value) onSave(next);
-    setTimeout(() => { busy.current = false; }, 100);
   };
 
   const onKeyDown = e => {
@@ -315,15 +354,94 @@ function EditableListItem({ value, onSave, onDelete }) {
   );
 }
 
-// Guards a confirm button against being tapped in the same instant it appears
-// (e.g. a double-tap landing on the button that just replaced what was tapped).
+// Keeps a confirm button inert briefly after it appears, so a fast second
+// click can't land on the button that just replaced what was clicked.
 function DelayedConfirm({ ms = 400, children }) {
   const [ready, setReady] = useState(false);
   useEffect(() => {
     const t = setTimeout(() => setReady(true), ms);
     return () => clearTimeout(t);
-  }, []);
+  }, [ms]);
   return children(ready);
+}
+
+function WeekNav({ week, setWeek }) {
+  const atCurrent = week === thisMonday();
+  return (
+    <div style={S.weekNav}>
+      <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+        <button style={S.btnSm} onClick={() => setWeek(shiftDays(week, -7))}>‹ Prev</button>
+        <span style={{ fontSize: "13px", fontWeight: 600, color: INK }}>{weekLabel(week)}</span>
+        <button style={S.btnSm} onClick={() => setWeek(shiftDays(week, 7))}>Next ›</button>
+        {!atCurrent && <button style={S.btnSm} onClick={() => setWeek(thisMonday())}>This week</button>}
+      </div>
+      <input type="date" value={week} onChange={e => e.target.value && setWeek(getMonday(e.target.value))}
+        style={{ fontSize: "12px" }} />
+    </div>
+  );
+}
+
+/* ── Summary tables ───────────────────────────────────────────────── */
+
+const cap = s => s.charAt(0).toUpperCase() + s.slice(1);
+
+function SummaryTable({ data, keyLabel }) {
+  const rows = Object.entries(data)
+    .sort((a, b) => (keyLabel === "week" ? a[0].localeCompare(b[0]) : b[1] - a[1]));
+  if (!rows.length) return <p style={S.muted}>No data yet.</p>;
+  const total = rows.reduce((s, [, m]) => s + m, 0);
+  return (
+    <table style={S.table}>
+      <thead><tr><th style={S.th}>{cap(keyLabel)}</th><th style={S.th}>Duration</th></tr></thead>
+      <tbody>
+        {rows.map(([k, m]) => (
+          <tr key={k}>
+            <td style={S.td}>{keyLabel === "week" ? weekLabel(k) : k}</td>
+            <td style={S.td}>{minsToClock(m)}</td>
+          </tr>
+        ))}
+      </tbody>
+      <tfoot>
+        <tr style={{ borderTop: `1.5px solid ${INK}`, background: "#e8e8e8" }}>
+          <td style={S.tdTotal}>Total</td>
+          <td style={S.tdTotal}>{minsToClock(total)}</td>
+        </tr>
+      </tfoot>
+    </table>
+  );
+}
+
+function DaySummaryTable({ weekStart, entries }) {
+  const { days, totals, weekTotal } = useMemo(() => {
+    const ds = Array.from({ length: 7 }, (_, i) => shiftDays(weekStart, i));
+    const byDate = entries.reduce((acc, e) => {
+      acc[e.date] = (acc[e.date] || 0) + e.duration;
+      return acc;
+    }, {});
+    const ts = ds.map(d => byDate[d] || 0);
+    return { days: ds, totals: ts, weekTotal: ts.reduce((s, v) => s + v, 0) };
+  }, [weekStart, entries]);
+
+  return (
+    <table style={S.table}>
+      <thead><tr><th style={S.th}>Day</th><th style={S.th}>Date</th><th style={S.th}>Duration</th></tr></thead>
+      <tbody>
+        {days.map((d, i) => (
+          <tr key={d}>
+            <td style={S.td}>{localDate(d).toLocaleString("default", { weekday: "short" })}</td>
+            <td style={S.td}>{d}</td>
+            <td style={S.td}>{minsToClock(totals[i])}</td>
+          </tr>
+        ))}
+      </tbody>
+      <tfoot>
+        <tr style={{ borderTop: `1.5px solid ${INK}`, background: "#e8e8e8" }}>
+          <td style={S.tdTotal} colSpan={2}>Total</td>
+          <td style={S.tdTotal}>{minsToClock(weekTotal)}</td>
+        </tr>
+      </tfoot>
+    </table>
+  );
 }
 
 /* ── File download ────────────────────────────────────────────────── */
@@ -345,17 +463,15 @@ const DAY_LABELS = ["Su", "M", "T", "W", "T", "F", "Sa"];
 const THIN = "1.5px solid #000";
 const THICK = "2.5px solid #000";
 const NONE = "none";
+const REG_CAP = 480; // 8 hours per day, in minutes
 
-// Column widths (px), in order A..N: JobName, #, TypeOfWork, TimeIn, TimeOut,
-// Su, M, T, W, T, F, Sa, HRS/Job, Code/Amount.
 const COL_WIDTHS = [90, 28, 110, 65, 65, 34, 34, 34, 34, 34, 34, 34, 55, 80];
 const COLGROUP = `<colgroup>${COL_WIDTHS.map(w => `<col width="${w}" style="width:${w}px;mso-width-source:userset;">`).join("")}</colgroup>`;
 
 const esc = s => String(s ?? "").replace(/[&<>"]/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[ch]));
 
-// Every border side is set explicitly (never a shorthand `border:` mixed with
-// a longhand override) — some HTML-to-spreadsheet importers (Google Sheets)
-// don't resolve that combination correctly and silently drop the override.
+// Every border side is declared explicitly — mixing a `border:` shorthand with
+// a longhand override confuses some HTML-to-spreadsheet importers.
 const cell = (content = "", { bg = WHITE, fg = "", align = "left", bold = false, span = 1, rowspan = 1, top = THIN, right = THIN, bottom = THIN, left = THIN, extra = "" } = {}) =>
   `<td colspan="${span}"${rowspan > 1 ? ` rowspan="${rowspan}"` : ""} style="border-top:${top};border-right:${right};border-bottom:${bottom};border-left:${left};font-size:11px;padding:5px 6px;` +
   `background:${bg};text-align:${align};${bold ? "font-weight:bold;" : ""}${fg ? `color:${fg};` : ""}${extra}">${content}</td>`;
@@ -363,25 +479,27 @@ const cell = (content = "", { bg = WHITE, fg = "", align = "left", bold = false,
 const row = cells => `<tr>${cells.join("")}</tr>`;
 const headCell = (text, span = 1, align = "left", sides = {}) => cell(text, { bg: BLACK, fg: "#fff", bold: true, span, align, ...sides });
 const colCell = (text, align = "left", sides = {}) => cell(text, { bg: DGRAY, fg: "#fff", bold: true, align, ...sides });
+const totalCell = (text, sides = {}) => cell(text, { bg: DGRAY, fg: "#fff", bold: true, align: "center", ...sides });
 
-function buildTimecard(weekEntries, weekEnd, employee) {
-  const REG_CAP = 480; // 8 hours, in minutes
+function buildTimecard(rowsForWeek, weekEnd, employee) {
+  // Overnight shifts book entirely to the day they started.
   const dayTotals = [0, 0, 0, 0, 0, 0, 0];
-  weekEntries.forEach(e => { dayTotals[dayOfWeek(e.date)] += e.duration; });
+  rowsForWeek.forEach(e => { dayTotals[dayOfWeek(e.date)] += e.duration; });
   const dayRegular = dayTotals.map(m => Math.min(m, REG_CAP));
   const dayOvertime = dayTotals.map(m => Math.max(0, m - REG_CAP));
-  const totalRegular = dayRegular.reduce((s, v) => s + v, 0);
-  const totalOvertime = dayOvertime.reduce((s, v) => s + v, 0);
+  const sum = arr => arr.reduce((s, v) => s + v, 0);
   const hrs = mins => (mins / 60).toFixed(4);
-  const rowCount = Math.max(20, weekEntries.length);
+  const val = mins => (mins > 0 ? hrs(mins) : "");
+  const rowCount = Math.max(20, rowsForWeek.length);
 
-  const rows = [
+  const out = [
     row([
       headCell("Weekly Time Card", 2, "left", { top: THICK, left: THICK }),
       headCell("", 12, "left", { top: THICK, right: THICK }),
     ]),
     row([
-      headCell("Employees Name:", 1, "left", { left: THICK }), headCell(""),
+      headCell("Employees Name:", 1, "left", { left: THICK }),
+      headCell(""),
       headCell(esc(employee), 2),
       headCell("", 1),
       headCell("Week Ending:", 3, "center"),
@@ -401,53 +519,50 @@ function buildTimecard(weekEntries, weekEnd, employee) {
   ];
 
   for (let i = 0; i < rowCount; i++) {
-    const e = weekEntries[i];
+    const e = rowsForWeek[i];
     const bg = i % 2 === 0 ? WHITE : LTGRAY;
     const day = e ? dayOfWeek(e.date) : -1;
-    const value = e ? hrs(e.duration) : "";
-    const isFirst = i === 0, isLast = i === rowCount - 1;
-    const dTop = isFirst ? THICK : THIN, dBottom = isLast ? THICK : THIN;
+    const hours = e ? hrs(e.duration) : "";
+    const top = i === 0 ? THICK : THIN;
+    const bottom = i === rowCount - 1 ? THICK : THIN;
+    const outLabel = e ? fmt12(e.timeOut) + (isOvernight(e) ? " (+1d)" : "") : "";
 
-    rows.push(row([
+    out.push(row([
       cell(e ? esc(e.client) : "", { bg, left: THICK }),
       cell(i + 1, { bg, align: "center" }),
       cell(e ? esc(e.task) : "", { bg }),
-      cell(e ? fmt12(e.timeIn) : "", { bg, align: "center", left: THICK, top: dTop, bottom: dBottom }),
-      cell(e ? fmt12(e.timeOut) : "", { bg, align: "center", right: THICK, top: dTop, bottom: dBottom }),
-      ...DAY_LABELS.map((_, d) => cell(day === d ? value : "", { bg, align: "center" })),
-      cell(value, { bg, align: "center" }),
+      cell(e ? fmt12(e.timeIn) : "", { bg, align: "center", left: THICK, top, bottom }),
+      cell(outLabel, { bg, align: "center", right: THICK, top, bottom }),
+      ...DAY_LABELS.map((_, d) => cell(day === d ? hours : "", { bg, align: "center" })),
+      cell(hours, { bg, align: "center" }),
       cell("", { bg, right: THICK }),
     ]));
   }
 
-  // Totals: Regular time (capped at 8h/day) on top, Overtime below — company
-  // info and the blank Code/Amount cell each span both rows.
-  rows.push(row([
+  out.push(row([
     cell("Aum Construction, Inc.<br>Post Office Box 1033<br>Mendocino, CA 95460",
       { span: 2, rowspan: 2, top: THICK, left: THICK, extra: "font-size:10px;vertical-align:middle;" }),
     cell("Total Regular Time:", { span: 3, bold: true, top: THICK, right: THICK }),
-    cell(dayRegular[0] > 0 ? hrs(dayRegular[0]) : "", { bg: DGRAY, fg: "#fff", bold: true, align: "center", top: THICK, left: THICK }),
-    ...dayRegular.slice(1).map(m => cell(m > 0 ? hrs(m) : "", { bg: DGRAY, fg: "#fff", bold: true, align: "center", top: THICK })),
-    cell(hrs(totalRegular), { bg: DGRAY, fg: "#fff", bold: true, align: "center", top: THICK, right: THICK }),
+    totalCell(val(dayRegular[0]), { top: THICK, left: THICK }),
+    ...dayRegular.slice(1).map(m => totalCell(val(m), { top: THICK })),
+    totalCell(hrs(sum(dayRegular)), { top: THICK, right: THICK }),
     cell("", { bg: LGRAY_HDR, rowspan: 2, top: THICK, right: THICK }),
   ]));
 
-  rows.push(row([
+  out.push(row([
     cell("Total Overtime:", { span: 3, bold: true, bottom: THICK, right: THICK }),
-    cell(dayOvertime[0] > 0 ? hrs(dayOvertime[0]) : "", { bg: DGRAY, fg: "#fff", bold: true, align: "center", bottom: THICK, left: THICK }),
-    ...dayOvertime.slice(1).map(m => cell(m > 0 ? hrs(m) : "", { bg: DGRAY, fg: "#fff", bold: true, align: "center", bottom: THICK })),
-    cell(hrs(totalOvertime), { bg: DGRAY, fg: "#fff", bold: true, align: "center", bottom: THICK, right: THICK }),
+    totalCell(val(dayOvertime[0]), { bottom: THICK, left: THICK }),
+    ...dayOvertime.slice(1).map(m => totalCell(val(m), { bottom: THICK })),
+    totalCell(hrs(sum(dayOvertime)), { bottom: THICK, right: THICK }),
   ]));
 
-  // Blank unbordered spacer row.
-  rows.push(row([cell("", { span: 14, top: NONE, right: NONE, bottom: NONE, left: NONE })]));
-
-  // Simplified signature line — no boxes, just underlines to write on.
-  rows.push(row([
-    cell("Signature:", { top: NONE, right: NONE, bottom: NONE, left: NONE, bold: true }),
-    cell("", { top: NONE, right: NONE, left: NONE, bottom: THIN, span: 5 }),
-    cell("Date:", { top: NONE, right: NONE, bottom: NONE, left: NONE, bold: true, align: "center" }),
-    cell("", { top: NONE, right: NONE, left: NONE, bottom: THIN, span: 7 }),
+  const bare = { top: NONE, right: NONE, bottom: NONE, left: NONE };
+  out.push(row([cell("", { span: 14, ...bare })]));
+  out.push(row([
+    cell("Signature:", { ...bare, bold: true }),
+    cell("", { ...bare, bottom: THIN, span: 5 }),
+    cell("Date:", { ...bare, bold: true, align: "center" }),
+    cell("", { ...bare, bottom: THIN, span: 7 }),
   ]));
 
   return `<html xmlns:o="urn:schemas-microsoft-com:office:office" ` +
@@ -455,7 +570,7 @@ function buildTimecard(weekEntries, weekEnd, employee) {
     `<head><meta charset="UTF-8"><!--[if gte mso 9]><xml><x:ExcelWorkbook><x:ExcelWorksheets>` +
     `<x:ExcelWorksheet><x:Name>Time Card</x:Name></x:ExcelWorksheet></x:ExcelWorksheets>` +
     `</x:ExcelWorkbook></xml><![endif]--></head><body>` +
-    `<table style="border-collapse:collapse;font-family:Arial,sans-serif;width:100%;">${COLGROUP}${rows.join("")}</table>` +
+    `<table style="border-collapse:collapse;font-family:Arial,sans-serif;width:100%;">${COLGROUP}${out.join("")}</table>` +
     `</body></html>`;
 }
 
@@ -463,7 +578,8 @@ function buildTimecard(weekEntries, weekEnd, employee) {
 
 const EMPLOYEE = "Sunny Chancellor";
 const TABS = ["track", "summary", "lists"];
-const cap = s => s.charAt(0).toUpperCase() + s.slice(1);
+const SUM_VIEWS = ["day", "week", "client", "task"];
+const BLANK_FORM = { client: "", task: "", date: "", in: "", out: "" };
 
 function App() {
   const [entries, setEntries] = useState([]);
@@ -475,25 +591,27 @@ function App() {
   const [tab, setTab] = useState("track");
   const [sumView, setSumView] = useState("day");
 
-  const [form, setForm] = useState({ client: "", task: "", date: "", in: "", out: "" });
+  const [form, setForm] = useState(BLANK_FORM);
   const [formErr, setFormErr] = useState("");
-  const setFormField = (key, val) => setForm(f => ({ ...f, [key]: val }));
+  const [pendingOvernight, setPendingOvernight] = useState(null);
 
   const [running, setRunning] = useState(false);
   const [startedAt, setStartedAt] = useState(null);
   const [elapsed, setElapsed] = useState(0);
-  const [timerClient, setTimerClient] = useState("");
-  const [timerTask, setTimerTask] = useState("");
+  const [timerJob, setTimerJob] = useState({ client: "", task: "" });
 
   const [newClient, setNewClient] = useState("");
   const [newTask, setNewTask] = useState("");
-  const [tcWeek, setTcWeek] = useState(() => getMonday(fmtDate(new Date())));
-  const [logWeek, setLogWeek] = useState(() => getMonday(fmtDate(new Date())));
-  const [sumWeek, setSumWeek] = useState(() => getMonday(fmtDate(new Date())));
+  const [listErr, setListErr] = useState("");
+
+  const [tcWeek, setTcWeek] = useState(thisMonday);
+  const [logWeek, setLogWeek] = useState(thisMonday);
+  const [sumWeek, setSumWeek] = useState(thisMonday);
+
   const [purgeBefore, setPurgeBefore] = useState("");
   const [confirmPurge, setConfirmPurge] = useState(false);
-  const [confirmDelete, setConfirmDelete] = useState(null); // { label, item, usage } | null
-  const [confirmDeleteId, setConfirmDeleteId] = useState(null);
+  const [confirmList, setConfirmList] = useState(null);
+  const [confirmEntry, setConfirmEntry] = useState(null);
 
   const [lastExportAt, setLastExportAt] = useState(null);
   const [lastModifiedAt, setLastModifiedAt] = useState(null);
@@ -502,24 +620,25 @@ function App() {
   const fileInputRef = useRef(null);
   const didInit = useRef(false);
 
+  // Any field edit invalidates a pending overnight confirmation.
+  const setField = (key, val) => {
+    setPendingOvernight(null);
+    setForm(f => ({ ...f, [key]: val }));
+  };
+
+  /* Load once */
   useEffect(() => {
-    (async () => {
-      const [e, i, c, t, le, lm] = await Promise.all([
-        store.get(KEYS.entries, []),
-        store.get(KEYS.increment, 15),
-        store.get(KEYS.clients, []),
-        store.get(KEYS.tasks, []),
-        store.get(KEYS.lastExport, null),
-        store.get(KEYS.lastModified, null),
-      ]);
-      setEntries(e);
-      setIncrement(Number(i) || 15);
-      setClients(c);
-      setTasks(t);
-      setLastExportAt(le);
-      setLastModifiedAt(lm);
-      setLoaded(true);
-    })();
+    const e = store.get(KEYS.entries, []);
+    const i = store.get(KEYS.increment, 15);
+    const c = store.get(KEYS.clients, []);
+    const t = store.get(KEYS.tasks, []);
+    setEntries(Array.isArray(e) ? e : []);
+    setIncrement(Number(i) || 15);
+    setClients(Array.isArray(c) ? c : []);
+    setTasks(Array.isArray(t) ? t : []);
+    setLastExportAt(store.get(KEYS.lastExport, null));
+    setLastModifiedAt(store.get(KEYS.lastModified, null));
+    setLoaded(true);
   }, []);
 
   usePersist(KEYS.entries, entries, loaded);
@@ -537,21 +656,19 @@ function App() {
 
   const dirty = entries.length > 0 && (!lastExportAt || (lastModifiedAt && lastModifiedAt > lastExportAt));
 
-  // Default the manual-entry Date / Time In / Time Out to pick up right where
-  // the most recent log left off — only when the form is blank (freshly
-  // loaded or just reset after a submit), so it never overwrites an
-  // in-progress edit.
+  // Chain the form off the most recent log while it's blank, so it never
+  // overwrites something in progress.
   useEffect(() => {
     if (!loaded) return;
-    if (form.date !== "" || form.in !== "" || form.out !== "") return;
+    if (form.date || form.in || form.out) return;
     const latest = entries[0];
-    if (latest) {
-      setForm(f => ({ ...f, date: latest.date, in: latest.timeOut, out: addOneHour(latest.timeOut) }));
-    } else {
-      setForm(f => ({ ...f, date: fmtDate(new Date()) }));
-    }
-  }, [entries, loaded]);
+    const nextDate = latest && (isOvernight(latest) ? shiftDays(latest.date, 1) : latest.date);
+    setForm(f => latest
+      ? { ...f, date: nextDate, in: latest.timeOut, out: addOneHour(latest.timeOut) }
+      : { ...f, date: today() });
+  }, [entries, loaded, form.date, form.in, form.out]);
 
+  /* Ticking clock */
   useEffect(() => {
     if (!running) return;
     const id = setInterval(() => setElapsed(Math.floor((Date.now() - startedAt) / 1000)), 1000);
@@ -563,20 +680,26 @@ function App() {
     [increment]
   );
 
-  const remember = useCallback((client, task) => {
-    const c = client.trim(), t = task.trim();
-    if (c) setClients(p => (p.includes(c) ? p : [...p, c].sort()));
-    if (t) setTasks(p => (p.includes(t) ? p : [...p, t].sort()));
+  const rememberClient = useCallback(name => {
+    const v = name.trim();
+    if (v) setClients(p => (p.includes(v) ? p : [...p, v].sort()));
   }, []);
 
-  const addEntry = entry => setEntries(p => [{ id: Date.now(), ...entry }, ...p]);
+  const rememberTask = useCallback(name => {
+    const v = name.trim();
+    if (v) setTasks(p => (p.includes(v) ? p : [...p, v].sort()));
+  }, []);
+
+  const addEntry = entry => setEntries(p => [{ id: makeId(), ...entry }, ...p]);
+
+  /* Actions */
 
   function startTimer() {
-    if (running || !form.client.trim() || !form.task.trim()) return;
-    const c = form.client.trim(), t = form.task.trim();
-    remember(c, t);
-    setTimerClient(c);
-    setTimerTask(t);
+    const client = form.client.trim(), task = form.task.trim();
+    if (running || !client || !task) return;
+    rememberClient(client);
+    rememberTask(task);
+    setTimerJob({ client, task });
     setStartedAt(Date.now());
     setElapsed(0);
     setRunning(true);
@@ -586,8 +709,8 @@ function App() {
     setRunning(false);
     const now = new Date(), start = new Date(startedAt);
     addEntry({
-      client: timerClient,
-      task: timerTask,
+      client: timerJob.client,
+      task: timerJob.task,
       date: fmtDate(start),
       timeIn: clockOf(start),
       timeOut: clockOf(now),
@@ -595,8 +718,16 @@ function App() {
     });
     setElapsed(0);
     setStartedAt(null);
-    setTimerClient("");
-    setTimerTask("");
+    setTimerJob({ client: "", task: "" });
+  }
+
+  function commitEntry(draft) {
+    rememberClient(draft.client);
+    rememberTask(draft.task);
+    addEntry(draft);
+    setForm(BLANK_FORM);
+    setPendingOvernight(null);
+    setFormErr("");
   }
 
   function addManual() {
@@ -606,62 +737,83 @@ function App() {
       setFormErr("Please fill in all fields.");
       return;
     }
-    const mins = toMins(tOut) - toMins(tIn);
-    if (mins <= 0) {
-      setFormErr("Time out must be after time in.");
+    const mins = spanMins(tIn, tOut);
+    if (mins === 0) {
+      setFormErr("Time in and time out can't be the same.");
       return;
     }
-    remember(client, task);
-    addEntry({ client, task, date, timeIn: tIn, timeOut: tOut, duration: calcDuration(mins) });
-    setForm({ client: "", task: "", date: "", in: "", out: "" });
+    const draft = {
+      client: client.trim(),
+      task: task.trim(),
+      date,
+      timeIn: tIn,
+      timeOut: tOut,
+      duration: calcDuration(mins),
+    };
+    // Crossing midnight is legitimate but easy to hit with a typo, so it takes
+    // an explicit yes rather than silently logging a near-24-hour shift.
+    if (toMins(tOut) < toMins(tIn)) {
+      setPendingOvernight(draft);
+      return;
+    }
+    commitEntry(draft);
   }
 
   function updateEntry(id, field, value) {
-    if (field === "client") remember(value, "");
-    if (field === "task") remember("", value);
+    if (field === "client") rememberClient(value);
+    if (field === "task") rememberTask(value);
     setEntries(p => p.map(e => {
       if (e.id !== id) return e;
       const next = { ...e, [field]: value };
       if (field === "timeIn" || field === "timeOut") {
-        const mins = toMins(next.timeOut) - toMins(next.timeIn);
+        const mins = spanMins(next.timeIn, next.timeOut);
         if (mins > 0) next.duration = calcDuration(mins);
       }
       return next;
     }));
   }
 
-  const deleteEntry = id => setEntries(p => p.filter(e => e.id !== id));
-
-  function shiftWeek(delta) {
-    setLogWeek(prev => {
-      const d = localDate(prev);
-      d.setDate(d.getDate() + 7 * delta);
-      return fmtDate(d);
-    });
+  function deleteEntry(id) {
+    setEntries(p => p.filter(e => e.id !== id));
+    setConfirmEntry(null);
   }
-
-  function shiftSumWeek(delta) {
-    setSumWeek(prev => {
-      const d = localDate(prev);
-      d.setDate(d.getDate() + 7 * delta);
-      return fmtDate(d);
-    });
-  }
-
-  const purgeCount = purgeBefore ? entries.filter(e => e.date < purgeBefore).length : 0;
 
   function purgeOldEntries() {
     setEntries(p => p.filter(e => e.date >= purgeBefore));
     setPurgeBefore("");
     setConfirmPurge(false);
+    setConfirmEntry(null);
   }
 
+  // Renaming onto an existing name merges the two, in the list and in every
+  // entry that referenced the old name.
   function renameInList(label, from, to) {
     const key = label === "Clients" ? "client" : "task";
     const setList = label === "Clients" ? setClients : setTasks;
-    setList(p => (p.includes(to) ? p : p.map(x => (x === from ? to : x)).sort()));
+    setList(p => (p.includes(to) ? p.filter(x => x !== from) : p.map(x => (x === from ? to : x)).sort()));
     setEntries(p => p.map(e => (e[key] === from ? { ...e, [key]: to } : e)));
   }
+
+  function removeFromList(label, item) {
+    (label === "Clients" ? setClients : setTasks)(p => p.filter(x => x !== item));
+    setConfirmList(null);
+  }
+
+  function addToList(label) {
+    const isClients = label === "Clients";
+    const draft = (isClients ? newClient : newTask).trim();
+    const items = isClients ? clients : tasks;
+    if (!draft) return;
+    if (items.includes(draft)) {
+      setListErr(`"${draft}" is already in the list.`);
+      return;
+    }
+    setListErr("");
+    (isClients ? setClients : setTasks)(p => [...p, draft].sort());
+    (isClients ? setNewClient : setNewTask)("");
+  }
+
+  /* Exports */
 
   function exportCSV() {
     const sorted = [...entries].sort((a, b) =>
@@ -669,21 +821,20 @@ function App() {
 
     const rows = [["Date", "Client", "Task", "Time In", "Time Out", "Duration (HH:MM)"]];
     sorted.forEach(e =>
-      rows.push([e.date, e.client, e.task, fmt12(e.timeIn), fmt12(e.timeOut), minsToHHMM(e.duration)]));
-
-    const section = (title, grouped) => {
-      rows.push([], [`--- ${title} ---`], ["Group", "Duration"]);
-      Object.entries(grouped)
-        .sort((a, b) => b[1] - a[1])
-        .forEach(([k, m]) => rows.push([k, minsToHHMM(m)]));
-      rows.push(["TOTAL", minsToHHMM(Object.values(grouped).reduce((s, v) => s + v, 0))]);
-    };
+      rows.push([e.date, e.client, e.task, fmt12(e.timeIn), fmt12(e.timeOut), minsToClock(e.duration)]));
 
     const groupBy = fn => sorted.reduce((acc, e) => {
       const k = fn(e);
       acc[k] = (acc[k] || 0) + e.duration;
       return acc;
     }, {});
+
+    const section = (title, grouped) => {
+      rows.push([], [`--- ${title} ---`], ["Group", "Duration"]);
+      Object.entries(grouped).sort((a, b) => b[1] - a[1])
+        .forEach(([k, m]) => rows.push([k, minsToClock(m)]));
+      rows.push(["TOTAL", minsToClock(Object.values(grouped).reduce((s, v) => s + v, 0))]);
+    };
 
     section("BY CLIENT", groupBy(e => e.client));
     section("BY TASK", groupBy(e => e.task));
@@ -701,49 +852,63 @@ function App() {
     setLastExportAt(Date.now());
   }
 
+  function exportTimecard() {
+    try {
+      const start = tcWeek || thisMonday();
+      const end = getSunday(start);
+      const rowsForWeek = entries
+        .filter(e => e.date >= start && e.date <= end)
+        .sort((a, b) => a.date.localeCompare(b.date) || a.timeIn.localeCompare(b.timeIn));
+      download(`timecard_${start}.xls`, buildTimecard(rowsForWeek, end, EMPLOYEE),
+        "application/vnd.ms-excel;charset=utf-8");
+    } catch (err) {
+      alert(`Export error: ${err.message}`);
+    }
+  }
+
   async function handleImportFile(file) {
     setImporting(true);
     setImportMsg("");
     try {
       const text = await file.text();
       const rows = parseEntriesCSV(text);
-      const existingKeys = new Set(entries.map(entryKey));
-      const seenClients = new Set(clients);
-      const seenTasks = new Set(tasks);
+      const seenKeys = new Set(entries.map(entryKey));
+      const nextClients = new Set(clients);
+      const nextTasks = new Set(tasks);
       const toAdd = [];
       let skipped = 0, unreadable = 0;
 
-      rows.forEach((r, i) => {
+      rows.forEach(r => {
         const date = (r["Date"] || "").trim();
         const client = (r["Client"] || "").trim();
         const task = (r["Task"] || "").trim();
         const timeIn = parseAmPmTime(r["Time In"]);
         const timeOut = parseAmPmTime(r["Time Out"]);
-        const durStr = (r["Duration (HH:MM)"] || "").trim();
-        const durMatch = /^(\d+):(\d{2})$/.exec(durStr);
-        if (!date || !client || !task || !timeIn || !timeOut || !durMatch) { unreadable++; return; }
+        const dur = /^(\d+):(\d{2})$/.exec((r["Duration (HH:MM)"] || "").trim());
+        if (!date || !client || !task || !timeIn || !timeOut || !dur) { unreadable++; return; }
 
         const key = `${date}|${client}|${task}|${timeIn}|${timeOut}`;
-        if (existingKeys.has(key)) { skipped++; return; }
-        existingKeys.add(key);
+        if (seenKeys.has(key)) { skipped++; return; }
+        seenKeys.add(key);
 
         toAdd.push({
-          id: Date.now() + i,
+          id: makeId(),
           date, client, task, timeIn, timeOut,
-          duration: Number(durMatch[1]) * 60 + Number(durMatch[2]),
+          duration: Number(dur[1]) * 60 + Number(dur[2]),
         });
-        seenClients.add(client);
-        seenTasks.add(task);
+        nextClients.add(client);
+        nextTasks.add(task);
       });
 
-      if (toAdd.length) setEntries(p => [...toAdd, ...p]);
+      parseListSection(text, "CLIENTS").forEach(c => nextClients.add(c));
+      parseListSection(text, "TASKS").forEach(t => nextTasks.add(t));
 
-      parseListSection(text, "CLIENTS").forEach(c => seenClients.add(c));
-      parseListSection(text, "TASKS").forEach(t => seenTasks.add(t));
-      const clientsGained = seenClients.size - clients.length;
-      const tasksGained = seenTasks.size - tasks.length;
-      setClients([...seenClients].sort());
-      setTasks([...seenTasks].sort());
+      const clientsGained = nextClients.size - clients.length;
+      const tasksGained = nextTasks.size - tasks.length;
+
+      if (toAdd.length) setEntries(p => [...toAdd, ...p]);
+      setClients([...nextClients].sort());
+      setTasks([...nextTasks].sort());
 
       const parts = [`${toAdd.length} ${toAdd.length === 1 ? "entry" : "entries"} imported`];
       if (skipped) parts.push(`${skipped} duplicate${skipped === 1 ? "" : "s"} skipped`);
@@ -758,104 +923,63 @@ function App() {
     }
   }
 
-  function exportTimecard() {
-    try {
-      const start = tcWeek || getMonday(fmtDate(new Date()));
-      const end = getSunday(start);
-      const weekEntries = entries
-        .filter(e => e.date >= start && e.date <= end)
-        .sort((a, b) => a.date.localeCompare(b.date) || a.timeIn.localeCompare(b.timeIn));
-      download(`timecard_${start}.xls`, buildTimecard(weekEntries, end, EMPLOYEE),
-        "application/vnd.ms-excel;charset=utf-8");
-    } catch (err) {
-      alert(`Export error: ${err.message}`);
-    }
-  }
+  /* Derived — memoised so typing in the form doesn't re-tally everything */
 
-  const totalMins = entries.reduce((s, e) => s + e.duration, 0);
-  const weekEntries = entries.filter(e => e.date >= logWeek && e.date <= getSunday(logWeek));
-  const tally = fn => entries.reduce((acc, e) => {
-    const k = fn(e);
-    acc[k] = (acc[k] || 0) + e.duration;
-    return acc;
-  }, {});
-  const summaries = {
-    client: tally(e => e.client),
-    task: tally(e => e.task),
-    week: tally(e => getMonday(e.date)),
-  };
+  const totalMins = useMemo(() => entries.reduce((s, e) => s + e.duration, 0), [entries]);
+
+  // Chronological, latest first, so back-filling an earlier day drops it into
+  // the right place rather than jumping to the top.
+  const weekRows = useMemo(() => {
+    const end = getSunday(logWeek);
+    return entries
+      .filter(e => e.date >= logWeek && e.date <= end)
+      .sort((a, b) => b.date.localeCompare(a.date) || toMins(b.timeIn) - toMins(a.timeIn));
+  }, [entries, logWeek]);
+
+  const summaries = useMemo(() => {
+    const tally = fn => entries.reduce((acc, e) => {
+      const k = fn(e);
+      acc[k] = (acc[k] || 0) + e.duration;
+      return acc;
+    }, {});
+    return {
+      client: tally(e => e.client),
+      task: tally(e => e.task),
+      week: tally(e => getMonday(e.date)),
+    };
+  }, [entries]);
+
+  const usage = useMemo(() => {
+    const client = {}, task = {};
+    for (const e of entries) {
+      client[e.client] = (client[e.client] || 0) + 1;
+      task[e.task] = (task[e.task] || 0) + 1;
+    }
+    return { Clients: client, Tasks: task };
+  }, [entries]);
+
+  const purgeCount = useMemo(
+    () => (purgeBefore ? entries.filter(e => e.date < purgeBefore).length : 0),
+    [entries, purgeBefore]
+  );
 
   const elapsedClock = [Math.floor(elapsed / 3600), Math.floor((elapsed % 3600) / 60), elapsed % 60]
     .map(PAD).join(":");
 
-  function SummaryTable({ data, keyLabel }) {
-    const rows = Object.entries(data)
-      .sort((a, b) => (keyLabel === "week" ? a[0].localeCompare(b[0]) : b[1] - a[1]));
-    if (!rows.length) return <p style={S.muted}>No data yet.</p>;
-    const total = rows.reduce((s, [, m]) => s + m, 0);
-    return (
-      <table style={S.table}>
-        <thead><tr><th style={S.th}>{cap(keyLabel)}</th><th style={S.th}>Duration</th></tr></thead>
-        <tbody>
-          {rows.map(([k, m]) => (
-            <tr key={k}>
-              <td style={S.td}>{keyLabel === "week" ? weekLabel(k) : k}</td>
-              <td style={S.td}>{minsToHHMM(m)}</td>
-            </tr>
-          ))}
-        </tbody>
-        <tfoot>
-          <tr style={{ borderTop: `1.5px solid ${INK}`, background: "#e8e8e8" }}>
-            <td style={S.tdTotal}>Total</td>
-            <td style={S.tdTotal}>{minsToHHMM(total)}</td>
-          </tr>
-        </tfoot>
-      </table>
-    );
-  }
-
-  function DaySummaryTable({ weekStart, entries }) {
-    const days = [];
-    for (let i = 0; i < 7; i++) {
-      const d = localDate(weekStart);
-      d.setDate(d.getDate() + i);
-      days.push(fmtDate(d));
-    }
-    const totals = days.map(ds => entries.filter(e => e.date === ds).reduce((s, e) => s + e.duration, 0));
-    const weekTotal = totals.reduce((s, v) => s + v, 0);
-    return (
-      <table style={S.table}>
-        <thead><tr><th style={S.th}>Day</th><th style={S.th}>Date</th><th style={S.th}>Duration</th></tr></thead>
-        <tbody>
-          {days.map((ds, i) => (
-            <tr key={ds}>
-              <td style={S.td}>{localDate(ds).toLocaleString("default", { weekday: "short" })}</td>
-              <td style={S.td}>{ds}</td>
-              <td style={S.td}>{minsToHHMM(totals[i])}</td>
-            </tr>
-          ))}
-        </tbody>
-        <tfoot>
-          <tr style={{ borderTop: `1.5px solid ${INK}`, background: "#e8e8e8" }}>
-            <td style={S.tdTotal} colSpan={2}>Total</td>
-            <td style={S.tdTotal}>{minsToHHMM(weekTotal)}</td>
-          </tr>
-        </tfoot>
-      </table>
-    );
-  }
+  const formCrossesMidnight = form.in && form.out && toMins(form.out) < toMins(form.in);
 
   const lists = [
-    { label: "Clients", items: clients, setItems: setClients, draft: newClient, setDraft: setNewClient },
-    { label: "Tasks", items: tasks, setItems: setTasks, draft: newTask, setDraft: setNewTask },
+    { label: "Clients", items: clients, draft: newClient, setDraft: setNewClient },
+    { label: "Tasks", items: tasks, draft: newTask, setDraft: setNewTask },
   ];
 
-  const addToList = ({ items, setItems, draft, setDraft }) => {
-    const v = draft.trim();
-    if (!v || items.includes(v)) return;
-    setItems(p => [...p, v].sort());
-    setDraft("");
-  };
+  const statusBar = entries.length === 0
+    ? { bg: PAPER, fg: "#777", text: "No entries yet" }
+    : !lastExportAt
+      ? { bg: WARN_BG, fg: WARN_FG, text: "Not backed up yet" }
+      : dirty
+        ? { bg: WARN_BG, fg: WARN_FG, text: `New changes since last backup (${timeAgo(lastExportAt)})` }
+        : { bg: OK_BG, fg: OK_FG, text: `Backed up ${timeAgo(lastExportAt)}` };
 
   return (
     <div style={{ fontFamily: "var(--font-sans)", background: "var(--color-background-primary)", borderRadius: "8px", overflow: "hidden", margin: "0.75rem" }}>
@@ -879,21 +1003,12 @@ function App() {
       <div style={{
         display: "flex", alignItems: "center", justifyContent: "space-between", gap: "8px",
         padding: "6px 1.25rem", fontSize: "12px", borderBottom: `0.5px solid ${RULE}`,
-        background: entries.length === 0 ? PAPER : dirty ? "#fdf3e3" : "#eaf6ec",
-        color: entries.length === 0 ? "#777" : dirty ? "#8a5a00" : "#2e7d43",
+        background: statusBar.bg, color: statusBar.fg,
       }}>
-        <span>
-          {entries.length === 0
-            ? "No entries yet"
-            : !lastExportAt
-              ? "Not backed up yet"
-              : dirty
-                ? `New changes since last backup (${timeAgo(lastExportAt)})`
-                : `Backed up ${timeAgo(lastExportAt)}`}
-        </span>
-        {dirty && entries.length > 0 && (
+        <span>{statusBar.text}</span>
+        {dirty && (
           <button onClick={exportCSV}
-            style={{ ...S.btnSm, borderColor: "#c9a35f", color: "#8a5a00", background: "transparent" }}>
+            style={{ ...S.btnSm, borderColor: "#c9a35f", color: WARN_FG, background: "transparent" }}>
             Export now
           </button>
         )}
@@ -907,143 +1022,159 @@ function App() {
               <div style={S.grid2}>
                 <div>
                   <div style={S.label}>Client</div>
-                  <ComboInput value={form.client} onChange={v => setFormField("client", v)} options={clients} placeholder="Client name" />
+                  <ComboInput value={form.client} onChange={v => setField("client", v)} options={clients} placeholder="Client name" />
                 </div>
                 <div>
                   <div style={S.label}>Task</div>
-                  <ComboInput value={form.task} onChange={v => setFormField("task", v)} options={tasks} placeholder="Task description" />
+                  <ComboInput value={form.task} onChange={v => setField("task", v)} options={tasks} placeholder="Task description" />
                 </div>
               </div>
+
               <div style={S.grid3}>
                 <div>
                   <div style={S.label}>Date</div>
-                  <input type="date" value={form.date} onChange={e => setFormField("date", e.target.value)} style={S.fill} />
+                  <input type="date" value={form.date} onChange={e => setField("date", e.target.value)} style={S.fill} />
                 </div>
                 <div>
                   <div style={S.label}>Time in</div>
-                  <TimePicker value={form.in} onChange={v => setFormField("in", v)} increment={increment} />
+                  <TimePicker value={form.in} onChange={v => setField("in", v)} increment={increment} />
                 </div>
                 <div>
-                  <div style={S.label}>Time out</div>
-                  <TimePicker value={form.out} onChange={v => setFormField("out", v)} increment={increment} />
+                  <div style={S.label}>
+                    Time out
+                    {formCrossesMidnight && <span style={{ color: WARN_FG, fontWeight: 600 }}> — next day</span>}
+                  </div>
+                  <TimePicker value={form.out} onChange={v => setField("out", v)} increment={increment} />
                 </div>
               </div>
-              {formErr && <div style={{ fontSize: "13px", color: "var(--color-text-danger)", marginBottom: "8px" }}>{formErr}</div>}
 
-              <div style={{ display: "flex", gap: "10px", alignItems: "center", flexWrap: "wrap" }}>
-                <button style={S.btnPrimary} onClick={addManual}>Add entry</button>
-                {!running ? (
-                  <button style={S.btnSec} onClick={startTimer} disabled={!form.client.trim() || !form.task.trim()}>
-                    Start timer
-                  </button>
-                ) : (
-                  <div style={{ display: "flex", alignItems: "center", gap: "10px", background: "#eaf6ec", padding: "6px 12px", borderRadius: "4px" }}>
-                    <span style={{ fontSize: "13px", color: "#2e7d43", fontVariantNumeric: "tabular-nums" }}>
-                      ⏱ {timerClient} · {timerTask} · {elapsedClock}
-                    </span>
-                    <button onClick={stopTimer} style={{ ...S.btnSm, background: "#c0392b", color: "#fff", border: "none" }}>
-                      Stop &amp; save
-                    </button>
+              {formErr && (
+                <div style={{ fontSize: "13px", color: "var(--color-text-danger)", marginBottom: "8px" }}>{formErr}</div>
+              )}
+
+              {pendingOvernight ? (
+                <div style={S.warnBox}>
+                  <p style={{ margin: "0 0 8px", fontSize: "13px", color: WARN_FG }}>
+                    {fmt12(pendingOvernight.timeIn)} to {fmt12(pendingOvernight.timeOut)} crosses midnight — that's{" "}
+                    <strong>{minsToClock(pendingOvernight.duration)}</strong>, logged to {pendingOvernight.date}. Is that right?
+                  </p>
+                  <div style={S.rowFlex}>
+                    <button style={S.btnPrimary} onClick={() => commitEntry(pendingOvernight)}>Yes, add it</button>
+                    <button style={S.btnSec} onClick={() => setPendingOvernight(null)}>Go back and fix</button>
                   </div>
-                )}
-              </div>
+                </div>
+              ) : (
+                <div style={S.rowFlex}>
+                  <button style={S.btnPrimary} onClick={addManual}>Add entry</button>
+                  {running ? (
+                    <div style={{ display: "flex", alignItems: "center", gap: "10px", background: OK_BG, padding: "6px 12px", borderRadius: "4px" }}>
+                      <span style={{ fontSize: "13px", color: OK_FG, fontVariantNumeric: "tabular-nums" }}>
+                        ⏱ {timerJob.client} · {timerJob.task} · {elapsedClock}
+                      </span>
+                      <button onClick={stopTimer} style={{ ...S.btnSm, background: DANGER, color: "#fff", border: "none" }}>
+                        Stop &amp; save
+                      </button>
+                    </div>
+                  ) : (
+                    <button style={S.btnSec} onClick={startTimer} disabled={!form.client.trim() || !form.task.trim()}>
+                      Start timer
+                    </button>
+                  )}
+                </div>
+              )}
             </div>
 
-            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "12px", flexWrap: "wrap", gap: "8px" }}>
-              <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-                <button style={S.btnSm} onClick={() => shiftWeek(-1)}>‹ Prev</button>
-                <span style={{ fontSize: "13px", fontWeight: 600, color: INK }}>{weekLabel(logWeek)}</span>
-                <button style={S.btnSm} onClick={() => shiftWeek(1)}>Next ›</button>
-                {logWeek !== getMonday(fmtDate(new Date())) && (
-                  <button style={S.btnSm} onClick={() => setLogWeek(getMonday(fmtDate(new Date())))}>This week</button>
-                )}
-              </div>
-              <input type="date" value={logWeek} onChange={e => setLogWeek(getMonday(e.target.value))} style={{ fontSize: "12px" }} />
-            </div>
+            <WeekNav week={logWeek} setWeek={setLogWeek} />
 
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px" }}>
-              <span style={{ fontSize: "13px", color: "var(--color-text-secondary)" }}>
-                {weekEntries.length} {weekEntries.length === 1 ? "entry" : "entries"} this week — click any cell to edit
-              </span>
-            </div>
-            {weekEntries.length === 0
-              ? <p style={{ color: "var(--color-text-tertiary)", fontSize: "14px" }}>No entries for this week.</p>
-              : (
-                <div style={{ overflowX: "auto" }}>
-                  <table style={S.table}>
-                    <thead>
-                      <tr>{["Date", "Client", "Task", "Time in", "Time out", "Duration", ""].map(h => <th key={h} style={S.th}>{h}</th>)}</tr>
-                    </thead>
-                    <tbody>
-                      {weekEntries.map(e => (
-                        <tr key={e.id} style={confirmDeleteId === e.id ? { background: "#fdecea" } : undefined}>
+            <p style={{ ...S.note, marginBottom: "12px" }}>
+              {weekRows.length} {weekRows.length === 1 ? "entry" : "entries"} this week — click any cell to edit
+            </p>
+
+            {weekRows.length === 0 ? (
+              <p style={{ color: "var(--color-text-tertiary)", fontSize: "14px" }}>No entries for this week.</p>
+            ) : (
+              <div style={{ overflowX: "auto" }}>
+                <table style={S.table}>
+                  <thead>
+                    <tr>{["Date", "Client", "Task", "Time in", "Time out", "Duration", ""].map(h => <th key={h} style={S.th}>{h}</th>)}</tr>
+                  </thead>
+                  <tbody>
+                    {weekRows.map(e => {
+                      const pending = confirmEntry === e.id;
+                      const bad = !isValidSpan(e);
+                      const overnight = isOvernight(e);
+                      return (
+                        <tr key={e.id} style={pending ? { background: "#fdecea" } : undefined}>
                           <td style={S.td}><EditableCell value={e.date} type="date" onChange={v => updateEntry(e.id, "date", v)} /></td>
                           <td style={S.td}><EditableCell value={e.client} options={clients} onChange={v => updateEntry(e.id, "client", v)} /></td>
                           <td style={S.td}><EditableCell value={e.task} options={tasks} onChange={v => updateEntry(e.id, "task", v)} /></td>
                           <td style={S.td}><EditableCell value={e.timeIn} display={fmt12(e.timeIn)} type="time" onChange={v => updateEntry(e.id, "timeIn", v)} /></td>
-                          <td style={S.td}><EditableCell value={e.timeOut} display={fmt12(e.timeOut)} type="time" onChange={v => updateEntry(e.id, "timeOut", v)} /></td>
-                          <td style={S.td}>{minsToHHMM(e.duration)}</td>
                           <td style={S.td}>
-                            {confirmDeleteId === e.id ? (
+                            <EditableCell value={e.timeOut} display={fmt12(e.timeOut)} type="time" onChange={v => updateEntry(e.id, "timeOut", v)} />
+                            {overnight && (
+                              <span title="Runs past midnight into the next day"
+                                style={{ marginLeft: "4px", fontSize: "11px", fontWeight: 600, color: WARN_FG }}>+1d</span>
+                            )}
+                          </td>
+                          <td style={bad ? { ...S.td, color: DANGER, fontWeight: 600 } : S.td}
+                            title={bad ? "Time in and time out are the same — this duration is stale." : undefined}>
+                            {minsToClock(e.duration)}{bad ? " ⚠" : ""}
+                          </td>
+                          <td style={S.td}>
+                            {pending ? (
                               <span style={{ display: "flex", gap: "4px", justifyContent: "flex-end" }}>
                                 <DelayedConfirm>
                                   {ready => (
-                                    <button
-                                      disabled={!ready}
-                                      onClick={() => { deleteEntry(e.id); setConfirmDeleteId(null); }}
-                                      title="Confirm delete"
-                                      style={{ background: ready ? "#c0392b" : "#e6b3ac", border: "none", color: "#fff", borderRadius: "3px", cursor: ready ? "pointer" : "default", fontSize: "12px", padding: "2px 6px" }}
-                                    >✓</button>
+                                    <button disabled={!ready} onClick={() => deleteEntry(e.id)} title="Confirm delete"
+                                      style={{ background: ready ? DANGER : DANGER_DIM, border: "none", color: "#fff", borderRadius: "3px", cursor: ready ? "pointer" : "default", fontSize: "12px", padding: "2px 6px" }}>✓</button>
                                   )}
                                 </DelayedConfirm>
-                                <button onClick={() => setConfirmDeleteId(null)} title="Cancel"
+                                <button onClick={() => setConfirmEntry(null)} title="Cancel"
                                   style={{ background: "none", border: "0.5px solid #bbb", color: "var(--color-text-secondary)", borderRadius: "3px", cursor: "pointer", fontSize: "12px", padding: "2px 6px" }}>✕</button>
                               </span>
                             ) : (
-                              <button onClick={() => setConfirmDeleteId(e.id)} aria-label="Delete entry"
+                              <button onClick={() => setConfirmEntry(e.id)} aria-label="Delete entry"
                                 style={{ background: "none", border: "none", cursor: "pointer", fontSize: "15px", color: "var(--color-text-tertiary)", padding: "0 2px" }}>×</button>
                             )}
                           </td>
                         </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              )}
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
 
-            <div style={{ marginTop: "1.5rem", borderTop: `0.5px solid ${RULE}`, paddingTop: "1.25rem" }}>
-              <p style={{ fontSize: "14px", fontWeight: 600, color: INK, marginBottom: "4px" }}>Purge old entries</p>
+            <div style={S.sectionBlock}>
+              <p style={S.sectionTitle}>Purge old entries</p>
               <p style={{ ...S.muted, marginBottom: "10px" }}>
                 Permanently remove entries dated before a given date. Make sure they're backed up (Summary tab) first — this can't be undone.
               </p>
-              <div style={{ display: "flex", gap: "10px", alignItems: "center", flexWrap: "wrap" }}>
-                <input type="date" value={purgeBefore} onChange={e => { setPurgeBefore(e.target.value); setConfirmPurge(false); }} style={{ fontSize: "13px" }} />
-                {!confirmPurge ? (
-                  <button
-                    style={{ ...S.btnSec, borderColor: "#c0392b", color: "#c0392b" }}
-                    onClick={() => { if (purgeBefore && purgeCount > 0) setConfirmPurge(true); }}
-                    disabled={!purgeBefore || purgeCount === 0}
-                  >
-                    {purgeBefore ? `Purge ${purgeCount} ${purgeCount === 1 ? "entry" : "entries"}` : "Purge…"}
-                  </button>
-                ) : (
+              <div style={S.rowFlex}>
+                <input type="date" value={purgeBefore}
+                  onChange={e => { setPurgeBefore(e.target.value); setConfirmPurge(false); }}
+                  style={{ fontSize: "13px" }} />
+                {confirmPurge ? (
                   <span style={{ display: "flex", alignItems: "center", gap: "8px", background: "#fdecea", padding: "6px 10px", borderRadius: "4px" }}>
-                    <span style={{ fontSize: "12px", color: "#c0392b" }}>
+                    <span style={{ fontSize: "12px", color: DANGER }}>
                       Really delete {purgeCount} {purgeCount === 1 ? "entry" : "entries"} before {purgeBefore}? This can't be undone.
                     </span>
                     <DelayedConfirm>
                       {ready => (
-                        <button
-                          disabled={!ready}
-                          onClick={purgeOldEntries}
-                          style={{ background: ready ? "#c0392b" : "#e6b3ac", border: "none", color: "#fff", borderRadius: "3px", cursor: ready ? "pointer" : "default", fontSize: "12px", padding: "4px 8px" }}
-                        >
+                        <button disabled={!ready} onClick={purgeOldEntries}
+                          style={{ background: ready ? DANGER : DANGER_DIM, border: "none", color: "#fff", borderRadius: "3px", cursor: ready ? "pointer" : "default", fontSize: "12px", padding: "4px 8px" }}>
                           Yes, purge
                         </button>
                       )}
                     </DelayedConfirm>
                     <button onClick={() => setConfirmPurge(false)} style={S.btnSm}>Cancel</button>
                   </span>
+                ) : (
+                  <button style={{ ...S.btnSec, borderColor: DANGER, color: DANGER }}
+                    onClick={() => setConfirmPurge(true)}
+                    disabled={!purgeBefore || purgeCount === 0}>
+                    {purgeBefore ? `Purge ${purgeCount} ${purgeCount === 1 ? "entry" : "entries"}` : "Purge…"}
+                  </button>
                 )}
               </div>
             </div>
@@ -1055,7 +1186,7 @@ function App() {
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "12px", marginBottom: "1.25rem" }}>
               <div style={S.statCard}>
                 <div style={S.statLabel}>Total time</div>
-                <div style={S.statValue}>{minsToHHMM(totalMins)}</div>
+                <div style={S.statValue}>{minsToClock(totalMins)}</div>
               </div>
               <div style={S.statCard}>
                 <div style={S.statLabel}>Total entries</div>
@@ -1064,49 +1195,40 @@ function App() {
             </div>
 
             <div style={{ display: "flex", gap: "4px", marginBottom: "1.25rem", background: PAPER, padding: "4px", borderRadius: "4px", width: "fit-content" }}>
-              {["day", "week", "client", "task"].map(v => (
+              {SUM_VIEWS.map(v => (
                 <button key={v} style={sumView === v ? S.segOn : S.segOff} onClick={() => setSumView(v)}>{cap(v)}</button>
               ))}
             </div>
 
             {sumView === "day" ? (
               <div>
-                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "12px", flexWrap: "wrap", gap: "8px" }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-                    <button style={S.btnSm} onClick={() => shiftSumWeek(-1)}>‹ Prev</button>
-                    <span style={{ fontSize: "13px", fontWeight: 600, color: INK }}>{weekLabel(sumWeek)}</span>
-                    <button style={S.btnSm} onClick={() => shiftSumWeek(1)}>Next ›</button>
-                    {sumWeek !== getMonday(fmtDate(new Date())) && (
-                      <button style={S.btnSm} onClick={() => setSumWeek(getMonday(fmtDate(new Date())))}>This week</button>
-                    )}
-                  </div>
-                  <input type="date" value={sumWeek} onChange={e => setSumWeek(getMonday(e.target.value))} style={{ fontSize: "12px" }} />
-                </div>
+                <WeekNav week={sumWeek} setWeek={setSumWeek} />
                 <DaySummaryTable weekStart={sumWeek} entries={entries} />
               </div>
             ) : (
               <SummaryTable data={summaries[sumView]} keyLabel={sumView} />
             )}
 
-            <div style={{ marginTop: "1.5rem", borderTop: `0.5px solid ${RULE}`, paddingTop: "1.25rem" }}>
-              <p style={{ fontSize: "14px", fontWeight: 600, color: INK, marginBottom: "10px" }}>Export timecard</p>
-              <div style={{ display: "flex", gap: "10px", alignItems: "flex-end", flexWrap: "wrap" }}>
+            <div style={S.sectionBlock}>
+              <p style={{ ...S.sectionTitle, marginBottom: "10px" }}>Export timecard</p>
+              <div style={{ ...S.rowFlex, alignItems: "flex-end" }}>
                 <div>
                   <div style={S.statLabel}>Week starting (Monday)</div>
-                  <input type="date" value={tcWeek} onChange={e => setTcWeek(getMonday(e.target.value))} style={{ fontSize: "13px" }} />
+                  <input type="date" value={tcWeek}
+                    onChange={e => e.target.value && setTcWeek(getMonday(e.target.value))}
+                    style={{ fontSize: "13px" }} />
                 </div>
-                <button style={S.btnSec} onClick={exportCSV}>Export CSV</button>
                 <button style={S.btnPrimary} onClick={exportTimecard}>Export Timecard (.xls)</button>
               </div>
             </div>
 
-            <div style={{ marginTop: "1.5rem", borderTop: `0.5px solid ${RULE}`, paddingTop: "1.25rem" }}>
-              <p style={{ fontSize: "14px", fontWeight: 600, color: INK, marginBottom: "4px" }}>Backup &amp; restore</p>
+            <div style={S.sectionBlock}>
+              <p style={S.sectionTitle}>Backup &amp; restore</p>
               <p style={{ ...S.muted, marginBottom: "10px" }}>
                 Export CSV regularly and save the file somewhere you control — that's your real backup.
                 If this app's data is ever lost, import that same CSV to restore it.
               </p>
-              <div style={{ display: "flex", gap: "10px", alignItems: "center", flexWrap: "wrap" }}>
+              <div style={S.rowFlex}>
                 <button style={S.btnSec} disabled={importing} onClick={() => fileInputRef.current?.click()}>
                   {importing ? "Importing…" : "Import CSV"}
                 </button>
@@ -1121,50 +1243,50 @@ function App() {
 
         {tab === "lists" && (
           <div>
-            {lists.map(list => (
-              <div key={list.label} style={{ marginBottom: "2rem" }}>
-                <p style={S.sectionHead}>{list.label} ({list.items.length})</p>
-                {list.items.length === 0 && <p style={S.muted}>No {list.label.toLowerCase()} yet.</p>}
-                {list.items.map(item => {
-                  const field = list.label === "Clients" ? "client" : "task";
-                  const usage = entries.filter(e => e[field] === item).length;
-                  const pending = confirmDelete?.label === list.label && confirmDelete?.item === item;
+            {listErr && <p style={{ fontSize: "13px", color: "var(--color-text-danger)", marginBottom: "10px" }}>{listErr}</p>}
+            {lists.map(({ label, items, draft, setDraft }) => (
+              <div key={label} style={{ marginBottom: "2rem" }}>
+                <p style={S.sectionHead}>{label} ({items.length})</p>
+                {items.length === 0 && <p style={S.muted}>No {label.toLowerCase()} yet.</p>}
+
+                {items.map(item => {
+                  const count = usage[label][item] || 0;
+                  const pending = confirmList?.label === label && confirmList?.item === item;
 
                   if (pending) {
                     return (
-                      <div key={item} style={{ display: "flex", alignItems: "center", gap: "8px", padding: "8px 0", borderBottom: `0.5px solid ${RULE}`, background: "#fdf3e3" }}>
-                        <span style={{ flex: 1, fontSize: "13px", color: "#8a5a00" }}>
-                          {usage > 0
-                            ? `"${item}" is used in ${usage} ${usage === 1 ? "entry" : "entries"} — removing it won't delete those entries. Remove anyway?`
+                      <div key={item} style={{ display: "flex", alignItems: "center", gap: "8px", padding: "8px 0", borderBottom: `0.5px solid ${RULE}`, background: WARN_BG }}>
+                        <span style={{ flex: 1, fontSize: "13px", color: WARN_FG }}>
+                          {count > 0
+                            ? `"${item}" is used in ${count} ${count === 1 ? "entry" : "entries"} — removing it won't delete those entries. Remove anyway?`
                             : `Remove "${item}" from the list?`}
                         </span>
                         <DelayedConfirm>
                           {ready => (
-                            <button
-                              disabled={!ready}
-                              onClick={() => { list.setItems(p => p.filter(x => x !== item)); setConfirmDelete(null); }}
-                              style={{ ...S.btnSm, background: ready ? "#c0392b" : "#e6b3ac", color: "#fff", border: "none", cursor: ready ? "pointer" : "default" }}
-                            >
+                            <button disabled={!ready} onClick={() => removeFromList(label, item)}
+                              style={{ ...S.btnSm, background: ready ? DANGER : DANGER_DIM, color: "#fff", border: "none", cursor: ready ? "pointer" : "default" }}>
                               Yes, remove
                             </button>
                           )}
                         </DelayedConfirm>
-                        <button style={S.btnSm} onClick={() => setConfirmDelete(null)}>Cancel</button>
+                        <button style={S.btnSm} onClick={() => setConfirmList(null)}>Cancel</button>
                       </div>
                     );
                   }
 
                   return (
                     <EditableListItem key={item} value={item}
-                      onSave={next => renameInList(list.label, item, next)}
-                      onDelete={() => setConfirmDelete({ label: list.label, item, usage })} />
+                      onSave={next => renameInList(label, item, next)}
+                      onDelete={() => setConfirmList({ label, item })} />
                   );
                 })}
+
                 <div style={{ display: "flex", gap: "8px", marginTop: "10px" }}>
-                  <input value={list.draft} onChange={e => list.setDraft(e.target.value)}
-                    onKeyDown={e => e.key === "Enter" && addToList(list)}
-                    placeholder={`New ${list.label.slice(0, -1).toLowerCase()} name`} style={{ flex: 1 }} />
-                  <button style={S.btnSec} onClick={() => addToList(list)}>Add</button>
+                  <input value={draft}
+                    onChange={e => { setDraft(e.target.value); setListErr(""); }}
+                    onKeyDown={e => e.key === "Enter" && addToList(label)}
+                    placeholder={`New ${label.slice(0, -1).toLowerCase()} name`} style={{ flex: 1 }} />
+                  <button style={S.btnSec} onClick={() => addToList(label)}>Add</button>
                 </div>
               </div>
             ))}
@@ -1181,10 +1303,10 @@ root.render(<App />);
 </script>
 
 <script>
-  // Manually transform and run the app source above, forcing the classic
-  // JSX runtime (plain React.createElement calls, no import statements) —
-  // avoids relying on Babel's automatic script-tag scanner, which doesn't
-  // reliably parse preset options passed via the data-presets attribute.
+  // Transform the source above with the classic JSX runtime (plain
+  // React.createElement, no import statements) and run it. Doing this manually
+  // avoids Babel's automatic script-tag scanner, which can't parse preset
+  // options from the data-presets attribute.
   const appSrc = document.getElementById("app-source").textContent;
   const { code } = Babel.transform(appSrc, {
     presets: [["react", { runtime: "classic" }]],
