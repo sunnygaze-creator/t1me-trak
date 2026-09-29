@@ -92,7 +92,16 @@ const weekLabel = mon => {
   };
   return `${short(mon)} – ${short(getSunday(mon))}`;
 };
-const dayOfWeek = dateStr => localDate(dateStr).getDay();
+
+// Monday-based day index (Mon=0 … Sun=6). getDay() is Sunday-based, which
+// would place the last day of a Mon–Sun week in the first column.
+const mondayIndex = dateStr => (localDate(dateStr).getDay() + 6) % 7;
+const shortMD = dateStr => {
+  const d = localDate(dateStr);
+  return `${d.getMonth() + 1}/${d.getDate()}`;
+};
+const yymmdd = dateStr => dateStr.slice(2).replace(/-/g, "");
+
 const today = () => fmtDate(new Date());
 const thisMonday = () => getMonday(today());
 
@@ -459,13 +468,14 @@ function download(filename, content, mime) {
 /* ── Timecard builder ─────────────────────────────────────────────── */
 
 const BLACK = "#1a1a1a", DGRAY = "#4a4a4a", LGRAY_HDR = "#c7c7c7", LTGRAY = "#e8e8e8", WHITE = "#fff";
-const DAY_LABELS = ["Su", "M", "T", "W", "T", "F", "Sa"];
+// Monday-first, matching the app's Mon–Sun week.
+const DAY_LABELS = ["M", "T", "W", "T", "F", "Sa", "Su"];
 const THIN = "1.5px solid #000";
 const THICK = "2.5px solid #000";
 const NONE = "none";
 const REG_CAP = 480; // 8 hours per day, in minutes
 
-const COL_WIDTHS = [90, 28, 110, 65, 65, 34, 34, 34, 34, 34, 34, 34, 55, 80];
+const COL_WIDTHS = [90, 28, 110, 65, 65, 40, 40, 40, 40, 40, 40, 40, 55, 80];
 const COLGROUP = `<colgroup>${COL_WIDTHS.map(w => `<col width="${w}" style="width:${w}px;mso-width-source:userset;">`).join("")}</colgroup>`;
 
 const esc = s => String(s ?? "").replace(/[&<>"]/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[ch]));
@@ -481,30 +491,33 @@ const headCell = (text, span = 1, align = "left", sides = {}) => cell(text, { bg
 const colCell = (text, align = "left", sides = {}) => cell(text, { bg: DGRAY, fg: "#fff", bold: true, align, ...sides });
 const totalCell = (text, sides = {}) => cell(text, { bg: DGRAY, fg: "#fff", bold: true, align: "center", ...sides });
 
-function buildTimecard(rowsForWeek, weekEnd, employee) {
+function buildTimecard(rowsForWeek, weekStart, weekEnd, employee) {
   // Overnight shifts book entirely to the day they started.
   const dayTotals = [0, 0, 0, 0, 0, 0, 0];
-  rowsForWeek.forEach(e => { dayTotals[dayOfWeek(e.date)] += e.duration; });
+  rowsForWeek.forEach(e => { dayTotals[mondayIndex(e.date)] += e.duration; });
   const dayRegular = dayTotals.map(m => Math.min(m, REG_CAP));
   const dayOvertime = dayTotals.map(m => Math.max(0, m - REG_CAP));
   const sum = arr => arr.reduce((s, v) => s + v, 0);
   const hrs = mins => (mins / 60).toFixed(4);
   const val = mins => (mins > 0 ? hrs(mins) : "");
   const rowCount = Math.max(20, rowsForWeek.length);
+  const weekDates = Array.from({ length: 7 }, (_, i) => shiftDays(weekStart, i));
 
   const out = [
     row([
       headCell("Weekly Time Card", 2, "left", { top: THICK, left: THICK }),
-      headCell("", 12, "left", { top: THICK, right: THICK }),
+      headCell("", 4, "left", { top: THICK }),
+      headCell("Week:", 2, "center", { top: THICK }),
+      headCell(`${weekStart}  –  ${weekEnd}`, 4, "center", { top: THICK }),
+      headCell("", 2, "left", { top: THICK, right: THICK }),
     ]),
     row([
       headCell("Employees Name:", 1, "left", { left: THICK }),
       headCell(""),
       headCell(esc(employee), 2),
       headCell("", 1),
-      headCell("Week Ending:", 3, "center"),
-      headCell(weekEnd, 3, "center"),
-      headCell("", 3, "left", { right: THICK }),
+      ...weekDates.map(d => headCell(shortMD(d), 1, "center")),
+      headCell("", 2, "left", { right: THICK }),
     ]),
     row([
       colCell("Job Name", "left", { bottom: THICK, left: THICK }),
@@ -521,7 +534,7 @@ function buildTimecard(rowsForWeek, weekEnd, employee) {
   for (let i = 0; i < rowCount; i++) {
     const e = rowsForWeek[i];
     const bg = i % 2 === 0 ? WHITE : LTGRAY;
-    const day = e ? dayOfWeek(e.date) : -1;
+    const day = e ? mondayIndex(e.date) : -1;
     const hours = e ? hrs(e.duration) : "";
     const top = i === 0 ? THICK : THIN;
     const bottom = i === rowCount - 1 ? THICK : THIN;
@@ -859,7 +872,8 @@ function App() {
       const rowsForWeek = entries
         .filter(e => e.date >= start && e.date <= end)
         .sort((a, b) => a.date.localeCompare(b.date) || a.timeIn.localeCompare(b.timeIn));
-      download(`timecard_${start}.xls`, buildTimecard(rowsForWeek, end, EMPLOYEE),
+      download(`timecard_${yymmdd(start)}-${yymmdd(end)}.xls`,
+        buildTimecard(rowsForWeek, start, end, EMPLOYEE),
         "application/vnd.ms-excel;charset=utf-8");
     } catch (err) {
       alert(`Export error: ${err.message}`);
@@ -1020,11 +1034,11 @@ function App() {
           <div>
             <div style={S.card}>
               <div style={S.grid2}>
-                <div>
+                <div style={{ minWidth: 0 }}>
                   <div style={S.label}>Client</div>
                   <ComboInput value={form.client} onChange={v => setField("client", v)} options={clients} placeholder="Client name" />
                 </div>
-                <div>
+                <div style={{ minWidth: 0 }}>
                   <div style={S.label}>Task</div>
                   <ComboInput value={form.task} onChange={v => setField("task", v)} options={tasks} placeholder="Task description" />
                 </div>
